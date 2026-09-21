@@ -55,6 +55,13 @@ The build prefers an official label whenever one exists and only falls back to
 translation for the remainder. Run the fetch script before a build; without the
 file the build still works, it is just slow and liable to be throttled again.
 
+**The platform already uses this same file.** `diagnostic.ar-api` keeps a copy
+at `data/hpo/hp-es.tsv`, converts it with `scripts/build_hpo_es.py` and serves
+the result as `label_es` from `/extract-hpo` — so the Spanish symptom names a
+user sees in the wizard come from exactly this source. Refresh both together,
+or the same HPO term will be named one way in the wizard and another on a gene
+card.
+
 ### Can the translation endpoint be authorised?
 
 Short answer: **the web endpoint cannot be, and now barely matters.**

@@ -6,6 +6,9 @@
 # is what got this build rate-limited, and the quality is better.
 set -euo pipefail
 
+# Default next to the other HPO data this build reads. The platform keeps its
+# own copy at diagnostic.ar-api/data/hpo/hp-es.tsv for /extract-hpo; both come
+# from the same upstream file and should be refreshed together.
 DEST="${1:-../diagnosticar-question-agent/data/hp-es.babelon.tsv}"
 URL="https://raw.githubusercontent.com/obophenotype/hpo-translations/main/babelon/hp-es.babelon.tsv"
 
