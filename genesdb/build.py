@@ -66,8 +66,8 @@ def _existing_translations(path: Path) -> dict[str, str]:
 def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
           only: list[str] | None = None, reuse: Path | None = None,
           ncbi_api_key: str | None = None, skip_translation: bool = False,
-          model_genes: Path | None = None, workers: int = 6,
-          translate_rate: float = 8.0) -> None:
+          model_genes: Path | None = None, workers: int = 2,
+          translate_rate: float = 2.0) -> None:
     phenotype_to_genes = data_dir / "phenotype_to_genes.txt"
     hpoa = data_dir / "phenotype.hpoa"
     obo = data_dir / "hp.obo"
@@ -111,9 +111,19 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
     by_ncbi = sources.fetch_ncbi(universe.values(), session)
     log.info("NCBI returned %d/%d genes", len(by_ncbi), len(universe))
 
+    translation_cache = _existing_translations(reuse) if reuse else {}
+    translation_cache_path = out_path.with_suffix(".translations.json")
+    if translation_cache_path.exists():
+        try:
+            saved = json.loads(translation_cache_path.read_text(encoding="utf-8"))
+            translation_cache.update(saved)
+            log.info("resuming with %d cached translations", len(saved))
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable translation cache: %s", exc)
+
     translator = BulkTranslator(
-        cache=_existing_translations(reuse) if reuse else {},
-        workers=workers, rate_per_second=translate_rate,
+        cache=translation_cache, workers=workers, rate_per_second=translate_rate,
+        cache_path=translation_cache_path,
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,11 +133,26 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
     create_schema(conn)
 
     # Pass 1 — gather every gene's source data and every string needing translation.
+    # Cached to disk: the fetch takes ~40 minutes, and a later failure must not
+    # throw it away.
+    cache_path = out_path.with_suffix(".fetch.json")
+    cached: dict[str, dict] = {}
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            log.info("reusing %d fetched genes from %s", len(cached), cache_path.name)
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable fetch cache: %s", exc)
+
     log.info("fetching UniProt for %d genes", len(universe))
     gathered: list[tuple[str, sources.GeneProfile]] = []
     failures = 0
 
     for index, (symbol, ncbi_id) in enumerate(universe.items(), start=1):
+        if symbol in cached:
+            restored = sources.GeneProfile(**cached[symbol])
+            gathered.append((symbol, restored))
+            continue
         profile = by_ncbi.get(ncbi_id)
         if profile is None:
             profile = sources.GeneProfile(simbolo=symbol, ncbi_id=ncbi_id)
@@ -149,8 +174,20 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
                 profile.referencias["UniProt"] = uni["referencia"]
 
         gathered.append((symbol, profile))
+        cached[symbol] = {
+            "simbolo": profile.simbolo, "ncbi_id": profile.ncbi_id,
+            "nombre_completo": profile.nombre_completo, "cromosoma": profile.cromosoma,
+            "ubicacion": profile.ubicacion, "aliases": profile.aliases,
+            "resumen": profile.resumen, "funcion_proteina": profile.funcion_proteina,
+            "uniprot_accession": profile.uniprot_accession,
+            "enfermedades_asociadas": profile.enfermedades_asociadas,
+            "codigo_omim": profile.codigo_omim, "referencias": profile.referencias,
+        }
         if index % 250 == 0:
+            cache_path.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
             log.info("UniProt %d/%d", index, len(universe))
+
+    cache_path.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
 
     # Pass 2 — one deduplicated translation pass over everything at once.
     if not skip_translation:
@@ -269,9 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-genes", type=Path,
                         help="genes.json from the GenPhenAI checkpoint — the authoritative "
                              "gene vocabulary; without it the HPO annotation files are used")
-    parser.add_argument("--workers", type=int, default=6,
-                        help="concurrent translation requests (default 6)")
-    parser.add_argument("--translate-rate", type=float, default=8.0,
+    parser.add_argument("--workers", type=int, default=2,
+                        help="concurrent translation requests (default 2)")
+    parser.add_argument("--translate-rate", type=float, default=2.0,
                         help="max translation requests per second across all workers")
     parser.add_argument("--skip-translation", action="store_true",
                         help="keep English text; for fast structural testing")
