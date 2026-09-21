@@ -22,15 +22,25 @@ pip install -r requirements.txt
 
 python -m genesdb.build \
   --data-dir ../diagnosticar-question-agent/data \
+  --model-genes /path/to/graphens_best_model/genes.json \
   --out genes.db \
-  --reuse genes_v4.db        # reuses ~10k existing translations, much faster
+  --reuse genes_v4.db        # reuses ~10k existing translations
+
+python -m genesdb.plain_language --db genes.db   # plain-Spanish rewrites
 
 scp genes.db nodo0-diagnostic.ar:~/…            # deploy is a copy, nothing more
 ```
 
-Useful flags: `--only CFTR MED16` and `--limit N` for smoke tests,
-`--skip-translation` for fast structural checks, `--ncbi-api-key` to raise the
-NCBI rate limit from 3/s to 10/s.
+A full build is **50–70 minutes**, a full rewrite pass about **an hour**.
+
+**`--model-genes` matters.** The model can only return symbols from its own
+vocabulary; the HPO annotation files omit 126 of them. See
+[docs/BUILDING.md](docs/BUILDING.md).
+
+The plain-language pass is **additive** — it writes only `resumen_llano_es` and
+never touches anything already in the database. It needs **human review before
+shipping**; the protocol and the sampling tool are in
+[docs/PLAIN_LANGUAGE.md](docs/PLAIN_LANGUAGE.md).
 
 ### Where the data comes from
 
@@ -79,7 +89,11 @@ genesdb/
   translate.py  EN→ES, cached
   schema.py     tables, layered by audience
   query.py      read-only access
-tests/          17 tests, no network
+  plain_language.py  build-time plain-Spanish rewrites, batched
+  codex.py           LLM access through the codex CLI
+tests/          27 tests, no network
+docs/           BUILDING.md, PLAIN_LANGUAGE.md (includes the review protocol)
+scripts/        review_sample.py — draws a manual-review sample
 legacy/         the original scripts, kept for reference — see below
 ```
 

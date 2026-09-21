@@ -157,3 +157,57 @@ def test_validate_rejects_overlong_text() -> None:
 
 def test_validate_allows_empty_when_source_is_insufficient() -> None:
     assert validate("")[0]
+
+
+def test_rewrite_only_touches_the_plain_language_column(tmp_path: Path) -> None:
+    """The pass is additive: nothing the database already holds may be lost."""
+    from genesdb import plain_language
+
+    path = tmp_path / "g.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    original = ("CFTR", "CF regulator", "7", "7q31.2", "ABCC7",
+                json.dumps([{"nombre": "Fibrosis quística", "descripcion_es": "d", "omim": "219700"}]),
+                None, "Texto técnico.", "Función.", "Technical.", "Function.",
+                "1080", "P13569", json.dumps(["219700"]), json.dumps({}), json.dumps({"x": 1}))
+    conn.execute("""INSERT INTO genes (simbolo, nombre_completo, cromosoma, ubicacion, aliases,
+        enfermedades_es, resumen_llano_es, tecnico_resumen_es, tecnico_funcion_es,
+        tecnico_resumen_en, tecnico_funcion_en, ncbi_id, uniprot_accession,
+        codigo_omim, referencias, raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", original)
+    conn.commit()
+    before = conn.execute("SELECT * FROM genes").fetchone()
+    conn.close()
+
+    plain_language.rewrite_batch = lambda rows, **kw: {"CFTR": "Texto llano."}
+    plain_language.run(path, workers=1)
+
+    conn = sqlite3.connect(path)
+    after = conn.execute("SELECT * FROM genes").fetchone()
+    columns = [d[0] for d in conn.execute("SELECT * FROM genes LIMIT 1").description]
+    conn.close()
+
+    changed = {c for c, b, a in zip(columns, before, after) if b != a}
+    assert changed == {"resumen_llano_es"}
+    assert after[columns.index("resumen_llano_es")] == "Texto llano."
+
+
+def test_rejected_rewrite_leaves_existing_value_untouched(tmp_path: Path) -> None:
+    """A rejection must not blank a column that already had a good value."""
+    from genesdb import plain_language
+
+    path = tmp_path / "g2.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute("""INSERT INTO genes (simbolo, enfermedades_es, resumen_llano_es,
+        tecnico_resumen_es, raw_json) VALUES (?,?,?,?,?)""",
+        ("CFTR", "[]", "Texto previo bueno.", "Técnico.", "{}"))
+    conn.commit()
+    conn.close()
+
+    plain_language.rewrite_batch = lambda rows, **kw: {}
+    plain_language.run(path, workers=1, overwrite=True)
+
+    conn = sqlite3.connect(path)
+    value = conn.execute("SELECT resumen_llano_es FROM genes WHERE simbolo='CFTR'").fetchone()[0]
+    conn.close()
+    assert value == "Texto previo bueno."
