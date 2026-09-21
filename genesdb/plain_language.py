@@ -19,11 +19,13 @@ import logging
 import re
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .codex import CodexError, complete
+from .codex import CodexError, CodexQuotaError
+from .llm import resolve
 
 log = logging.getLogger("genesdb.plain_language")
 
@@ -90,7 +92,7 @@ def validate(text: str) -> tuple[bool, str]:
 
 
 def rewrite_batch(rows: list[sqlite3.Row], *, model: str | None = None,
-                  timeout: int = 600) -> dict[str, str]:
+                  timeout: int = 600, complete=None) -> dict[str, str]:
     """Rewrite a batch of genes in one call, returning {symbol: text}.
 
     Batching is what makes a full run practical: one call per gene would be
@@ -103,7 +105,7 @@ def rewrite_batch(rows: list[sqlite3.Row], *, model: str | None = None,
         "enfermedades": [d.get("nombre", "") for d in json.loads(row["enfermedades_es"] or "[]")][:3],
     } for row in rows], ensure_ascii=False)
 
-    response = complete(
+    response = (complete or resolve())(
         PROMPT.format(max_chars=MAX_CHARS, count=len(rows), payload=payload),
         SCHEMA, model=model, timeout=timeout,
     )
@@ -130,7 +132,8 @@ def rewrite_batch(rows: list[sqlite3.Row], *, model: str | None = None,
 
 def run(db_path: Path, *, limit: int | None = None, only: list[str] | None = None,
         model: str | None = None, overwrite: bool = False,
-        batch_size: int = BATCH_SIZE, workers: int = 3) -> None:
+        batch_size: int = BATCH_SIZE, workers: int = 3,
+        backend: str | None = None) -> None:
     """Fill `resumen_llano_es`, additively.
 
     Only that one column is ever written. Nothing already in the database is
@@ -165,9 +168,23 @@ def run(db_path: Path, *, limit: int | None = None, only: list[str] | None = Non
     written = failed = 0
     started = time.monotonic()
 
+    complete = resolve(backend)
+    quota_exhausted = threading.Event()
+
     def work(batch: list[sqlite3.Row]) -> dict[str, str]:
+        # Once the subscription is out of credit every remaining batch will fail
+        # the same way, several minutes at a time. Stop asking.
+        if quota_exhausted.is_set():
+            return {}
         try:
-            return rewrite_batch(batch, model=model)
+            return rewrite_batch(batch, model=model, complete=complete)
+        except CodexQuotaError as exc:
+            if not quota_exhausted.is_set():
+                quota_exhausted.set()
+                log.error("codex usage limit reached — stopping. Rerun after it "
+                          "resets; genes already written are skipped. %s",
+                          str(exc).strip().splitlines()[-1] if str(exc).strip() else "")
+            return {}
         except CodexError as exc:
             log.warning("batch failed — %s", exc)
             return {}
@@ -187,7 +204,12 @@ def run(db_path: Path, *, limit: int | None = None, only: list[str] | None = Non
                      index, len(batches), written, failed, eta)
 
     conn.close()
-    log.info("done: %d written, %d batches failed", written, failed)
+    if quota_exhausted.is_set():
+        remaining = len(rows) - written
+        log.error("stopped on the usage limit: %d written, %d genes still "
+                  "without a summary. Rerun after the quota resets.", written, remaining)
+    else:
+        log.info("done: %d written, %d batches failed", written, failed)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -196,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--only", nargs="+")
     parser.add_argument("--model")
+    parser.add_argument("--backend", choices=["claude", "codex"],
+                        help="which CLI to call (default claude)")
     parser.add_argument("--overwrite", action="store_true",
                         help="redo genes that already have a rewrite")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
@@ -208,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
     run(args.db, limit=args.limit, only=args.only, model=args.model,
-        overwrite=args.overwrite, batch_size=args.batch_size, workers=args.workers)
+        overwrite=args.overwrite, batch_size=args.batch_size, workers=args.workers,
+        backend=args.backend)
     return 0
 
 

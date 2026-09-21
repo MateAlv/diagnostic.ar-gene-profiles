@@ -21,6 +21,14 @@ class CodexError(RuntimeError):
     pass
 
 
+class CodexQuotaError(CodexError):
+    """The subscription is out of credit until it resets.
+
+    Distinct from a transient failure: retrying cannot help, and every further
+    call wastes minutes discovering the same thing.
+    """
+
+
 def available() -> bool:
     return shutil.which("codex") is not None
 
@@ -58,7 +66,10 @@ def complete(prompt: str, schema: dict[str, Any], *, model: str | None = None,
             raise CodexError(f"codex timed out after {timeout}s") from exc
 
         if result.returncode != 0:
-            raise CodexError(f"codex exited {result.returncode}: {result.stderr[-400:]}")
+            detail = f"{result.stdout[-600:]}\n{result.stderr[-600:]}"
+            if "usage limit" in detail or "purchase more credits" in detail:
+                raise CodexQuotaError(detail.strip())
+            raise CodexError(f"codex exited {result.returncode}: {detail.strip()[-600:]}")
         if not out_path.exists():
             raise CodexError("codex produced no output file")
 
