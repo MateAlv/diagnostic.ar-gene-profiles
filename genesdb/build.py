@@ -24,6 +24,18 @@ from .translate import Translator, clean_source_text
 log = logging.getLogger("genesdb.build")
 
 
+def read_model_genes(path: Path) -> list[str]:
+    """Read the model's gene vocabulary (``genes.json`` from the checkpoint).
+
+    This is the authoritative list: the classifier has one output per entry, so
+    the model cannot return a symbol that is not here. ``-`` is the placeholder
+    class, not a gene.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    genes = data if isinstance(data, list) else (data.get("genes") or list(data))
+    return [str(g).strip().upper() for g in genes if str(g).strip() and str(g).strip() != "-"]
+
+
 def _existing_translations(path: Path) -> dict[str, str]:
     """Reuse translations from a previous database so a rebuild is cheap."""
     if not path.exists():
@@ -53,7 +65,8 @@ def _existing_translations(path: Path) -> dict[str, str]:
 
 def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
           only: list[str] | None = None, reuse: Path | None = None,
-          ncbi_api_key: str | None = None, skip_translation: bool = False) -> None:
+          ncbi_api_key: str | None = None, skip_translation: bool = False,
+          model_genes: Path | None = None) -> None:
     phenotype_to_genes = data_dir / "phenotype_to_genes.txt"
     hpoa = data_dir / "phenotype.hpoa"
     obo = data_dir / "hp.obo"
@@ -68,14 +81,32 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
     labels = hpo.read_hpo_labels(obo)
     expected = hpo.read_expected_symptoms(hpoa, labels)
 
+    session = sources._session(ncbi_api_key)
+    vocabulary: list[str] | None = None
+
+    if model_genes:
+        vocabulary = read_model_genes(model_genes)
+        log.info("model vocabulary: %d genes", len(vocabulary))
+
+        # Genes the model ranks but HPO does not annotate have no id in the
+        # annotation files; resolve those by symbol so none is left unexplained.
+        unknown = [g for g in vocabulary if g not in universe]
+        if unknown:
+            log.info("resolving %d symbols absent from the HPO files", len(unknown))
+            universe = {**universe, **sources.resolve_symbols(unknown, session)}
+
+        universe = {g: universe[g] for g in vocabulary if g in universe}
+        still_missing = [g for g in vocabulary if g not in universe]
+        if still_missing:
+            log.warning("%d model genes could not be resolved: %s",
+                        len(still_missing), ", ".join(sorted(still_missing)[:20]))
+
     if only:
         wanted = {s.strip().upper() for s in only}
         universe = {k: v for k, v in universe.items() if k in wanted}
     if limit:
         universe = dict(list(universe.items())[:limit])
     log.info("building %d genes", len(universe))
-
-    session = sources._session(ncbi_api_key)
     by_ncbi = sources.fetch_ncbi(universe.values(), session)
     log.info("NCBI returned %d/%d genes", len(by_ncbi), len(universe))
 
@@ -171,6 +202,7 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
         "ncbi_missing": str(failures),
         "source_phenotype_to_genes": str(phenotype_to_genes),
         "translated": "no" if skip_translation else "google-translate-web",
+        "gene_universe": "model-vocabulary" if model_genes else "hpo-annotations",
     })
     conn.execute("VACUUM")
     conn.close()
@@ -207,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", nargs="+", help="build only these gene symbols")
     parser.add_argument("--reuse", type=Path, help="previous .db to reuse translations from")
     parser.add_argument("--ncbi-api-key", help="raises the NCBI rate limit from 3/s to 10/s")
+    parser.add_argument("--model-genes", type=Path,
+                        help="genes.json from the GenPhenAI checkpoint — the authoritative "
+                             "gene vocabulary; without it the HPO annotation files are used")
     parser.add_argument("--skip-translation", action="store_true",
                         help="keep English text; for fast structural testing")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -217,7 +252,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     build(args.data_dir, args.out, limit=args.limit, only=args.only, reuse=args.reuse,
-          ncbi_api_key=args.ncbi_api_key, skip_translation=args.skip_translation)
+          ncbi_api_key=args.ncbi_api_key, skip_translation=args.skip_translation,
+          model_genes=args.model_genes)
     return 0
 
 
