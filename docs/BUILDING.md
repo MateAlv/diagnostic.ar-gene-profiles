@@ -62,6 +62,34 @@ user sees in the wizard come from exactly this source. Refresh both together,
 or the same HPO term will be named one way in the wizard and another on a gene
 card.
 
+### Disease names go through codex, not the web endpoint
+
+The public endpoint blocked this build twice, and disease names were the
+casualty both times — the second run finished with 39% of them still in
+English. `genesdb/translate_codex.py` translates them through the `codex` CLI
+instead:
+
+```bash
+python -m genesdb.translate_codex --db genes.db
+```
+
+Roughly 50 names per call, three calls in parallel. It is **additive**: it
+writes disease names only, never touches descriptions, and a name with no
+translation keeps what it had.
+
+It is also better than a general translator for this material, because it knows
+standard Spanish medical nomenclature and leaves eponyms and type numbers
+intact:
+
+| English | codex |
+|---|---|
+| Acrofacial dysostosis 1, Nager type | Disostosis acrofacial 1, tipo Nager |
+| Acyl-CoA dehydrogenase medium-chain deficiency | Deficiencia de acil-CoA deshidrogenasa de cadena media |
+| Bardet-Biedl syndrome 1 | Síndrome de Bardet-Biedl de tipo 1 |
+
+A translation is accepted only for a string that was actually sent, so a
+hallucinated key cannot poison the cache for a later build.
+
 ### Can the translation endpoint be authorised?
 
 Short answer: **the web endpoint cannot be, and now barely matters.**
