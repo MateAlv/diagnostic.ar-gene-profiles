@@ -320,14 +320,41 @@ def test_apply_cache_translates_names_and_leaves_the_rest(tmp_path: Path) -> Non
     assert diseases[0]["descripcion_es"] == "Un trastorno…"
 
 
-def test_a_batch_ignores_keys_it_did_not_ask_for(monkeypatch, tmp_path: Path) -> None:
+def test_a_batch_ignores_keys_it_did_not_ask_for() -> None:
     """A hallucinated key would poison the cache for every later build."""
     from genesdb import translate_codex
 
-    monkeypatch.setattr(translate_codex, "complete", lambda *a, **k: {"translations": [
-        {"en": "Cystic fibrosis", "es": "Fibrosis quística"},
-        {"en": "Never sent", "es": "Inventado"},
-    ]})
-    result = translate_codex._translate_batch(["Cystic fibrosis"], model=None, timeout=60)
+    def fake_complete(*_args, **_kwargs):
+        return {"translations": [
+            {"en": "Cystic fibrosis", "es": "Fibrosis quística"},
+            {"en": "Never sent", "es": "Inventado"},
+        ]}
+
+    result = translate_codex._translate_batch(
+        ["Cystic fibrosis"], model=None, timeout=60, complete=fake_complete)
 
     assert result == {"Cystic fibrosis": "Fibrosis quística"}
+
+
+# --- LLM backend selection --------------------------------------------------
+
+def test_resolve_defaults_to_claude() -> None:
+    from genesdb import claude_cli, llm
+    assert llm.resolve() is claude_cli.complete
+
+
+def test_resolve_picks_the_named_backend() -> None:
+    from genesdb import codex, llm
+    assert llm.resolve("codex") is codex.complete
+
+
+def test_resolve_rejects_an_unknown_backend() -> None:
+    from genesdb import llm
+    with pytest.raises(SystemExit, match="unknown backend"):
+        llm.resolve("gpt2")
+
+
+def test_quota_errors_are_distinguishable_from_transient_ones() -> None:
+    """Retrying a spent quota only burns minutes rediscovering the same wall."""
+    from genesdb.codex import CodexError, CodexQuotaError
+    assert issubclass(CodexQuotaError, CodexError)
