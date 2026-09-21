@@ -211,3 +211,40 @@ def test_rejected_rewrite_leaves_existing_value_untouched(tmp_path: Path) -> Non
     value = conn.execute("SELECT resumen_llano_es FROM genes WHERE simbolo='CFTR'").fetchone()[0]
     conn.close()
     assert value == "Texto previo bueno."
+
+
+# --- phenotype matching -----------------------------------------------------
+
+def test_match_symptoms_splits_reported_from_unreported(db: GeneProfileDB) -> None:
+    result = db.match_symptoms("CFTR", ["HP:0012236"])
+    assert [m["nombre"] for m in result["matched"]] == ["Cloruro elevado en sudor"]
+    assert [u["nombre"] for u in result["unreported"]] == ["Bronquiectasia"]
+    assert result["expected_count"] == 2
+
+
+def test_match_symptoms_orders_unreported_by_frequency(db: GeneProfileDB) -> None:
+    """The most frequent unreported symptom is the most useful question."""
+    result = db.match_symptoms("CFTR", [])
+    frequencies = [u["frecuencia_pct"] for u in result["unreported"]]
+    assert frequencies == sorted(frequencies, reverse=True)
+
+
+def test_match_symptoms_is_case_insensitive_on_reported_ids(db: GeneProfileDB) -> None:
+    assert len(db.match_symptoms("CFTR", ["hp:0012236"])["matched"]) == 1
+
+
+def test_match_symptoms_unknown_gene_returns_none(db: GeneProfileDB) -> None:
+    assert db.match_symptoms("NOTAGENE", ["HP:0012236"]) is None
+
+
+def test_match_symptoms_gene_without_diseases_is_not_an_error(tmp_path: Path) -> None:
+    """10% of genes have no associated disease; that is a valid, empty result."""
+    path = tmp_path / "n.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute("INSERT INTO genes (simbolo, codigo_omim, raw_json) VALUES ('XYZ', '[]', '{}')")
+    conn.commit()
+    conn.close()
+
+    result = GeneProfileDB(path).match_symptoms("XYZ", ["HP:0012236"])
+    assert result == {"matched": [], "unreported": [], "reported_count": 1, "expected_count": 0}
