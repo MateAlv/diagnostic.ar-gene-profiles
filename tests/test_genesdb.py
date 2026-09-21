@@ -268,3 +268,66 @@ def test_read_spanish_labels_keeps_only_term_names(tmp_path: Path) -> None:
 def test_read_spanish_labels_missing_file_is_not_fatal(tmp_path: Path) -> None:
     from genesdb.hpo import read_spanish_labels
     assert read_spanish_labels(tmp_path / "absent.tsv") == {}
+
+
+# --- codex translation of disease names -------------------------------------
+
+def _seed_diseases(path: Path, diseases: list[dict]) -> None:
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, enfermedades_es, raw_json) VALUES (?,?,?)",
+        ("CFTR", json.dumps(diseases, ensure_ascii=False), "{}"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_collect_untranslated_skips_what_the_cache_already_has(tmp_path: Path) -> None:
+    from genesdb.translate_codex import collect_untranslated
+
+    path = tmp_path / "g.db"
+    _seed_diseases(path, [
+        {"nombre": "Cystic fibrosis", "descripcion_es": "", "omim": "219700"},
+        {"nombre": "Alexander disease", "descripcion_es": "", "omim": "203450"},
+    ])
+    conn = sqlite3.connect(path)
+    pending = collect_untranslated(conn, {"Alexander disease": "Enfermedad de Alexander"})
+    conn.close()
+
+    assert pending == ["Cystic fibrosis"]
+
+
+def test_apply_cache_translates_names_and_leaves_the_rest(tmp_path: Path) -> None:
+    from genesdb.translate_codex import apply_cache
+
+    path = tmp_path / "g2.db"
+    _seed_diseases(path, [
+        {"nombre": "Cystic fibrosis", "descripcion_es": "Un trastorno…", "omim": "219700"},
+        {"nombre": "Sin traducción", "descripcion_es": "Otro", "omim": "000001"},
+    ])
+    conn = sqlite3.connect(path)
+    updated = apply_cache(conn, {"Cystic fibrosis": "Fibrosis quística"})
+    diseases = json.loads(
+        conn.execute("SELECT enfermedades_es FROM genes WHERE simbolo='CFTR'").fetchone()[0]
+    )
+    conn.close()
+
+    assert updated == 1
+    assert diseases[0]["nombre"] == "Fibrosis quística"
+    # Untranslated names keep what they had, and descriptions are never touched.
+    assert diseases[1]["nombre"] == "Sin traducción"
+    assert diseases[0]["descripcion_es"] == "Un trastorno…"
+
+
+def test_a_batch_ignores_keys_it_did_not_ask_for(monkeypatch, tmp_path: Path) -> None:
+    """A hallucinated key would poison the cache for every later build."""
+    from genesdb import translate_codex
+
+    monkeypatch.setattr(translate_codex, "complete", lambda *a, **k: {"translations": [
+        {"en": "Cystic fibrosis", "es": "Fibrosis quística"},
+        {"en": "Never sent", "es": "Inventado"},
+    ]})
+    result = translate_codex._translate_batch(["Cystic fibrosis"], model=None, timeout=60)
+
+    assert result == {"Cystic fibrosis": "Fibrosis quística"}
