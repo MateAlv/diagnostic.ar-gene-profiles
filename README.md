@@ -19,6 +19,7 @@ which HPO release, which day, how many genes.
 
 ```bash
 pip install -r requirements.txt
+scripts/fetch_hpo_translations.sh      # official Spanish HPO labels — do this first
 
 python -m genesdb.build \
   --data-dir ../diagnosticar-question-agent/data \
@@ -50,14 +51,18 @@ shipping**; the protocol and the sampling tool are in
 | NCBI Gene (E-utilities) | name, chromosome, location, aliases, summary |
 | UniProtKB (reviewed only) | protein function, diseases, OMIM ids |
 | `phenotype.hpoa` + `hp.obo` (HPO) | **expected symptoms with frequencies** |
+| `hp-es.babelon.tsv` (HPO i18n) | official Spanish symptom names, 97.6% coverage |
 
 The HPO files currently live in `../diagnosticar-question-agent/data/`
 (release **2026-06-23**).
 
-Translation to Spanish still goes through an undocumented, unauthenticated
-Google endpoint — the same one that produced the original data. It is isolated
-in `genesdb/translate.py` so it can be replaced without touching the build, and
-translations are cached and reused across rebuilds.
+Symptom names come from the **official HPO Spanish translations**, which are
+human-curated and cover 97.6% of terms. Only gene summaries and the remaining
+~481 labels go through machine translation, which is isolated in
+`genesdb/translate.py`. That endpoint is undocumented and unauthenticated and
+**will block an IP that calls it at volume** — see
+[docs/BUILDING.md](docs/BUILDING.md). Builds resume from disk caches, so a
+block costs time rather than work.
 
 ## Two audiences, one call
 

@@ -130,3 +130,31 @@ def read_expected_symptoms(hpoa_path: Path, labels: dict[str, str]) -> dict[str,
 
     log.info("expected symptoms: %d diseases", len(by_disease))
     return dict(by_disease)
+
+
+def read_spanish_labels(babelon_path: Path) -> dict[str, str]:
+    """Official Spanish HPO labels from the HPO Internationalisation Effort.
+
+    These are human-curated, so they are both better than machine translation
+    and free — they remove ~20k calls to the translation endpoint, which is
+    what got this build rate-limited in the first place.
+
+    File: hpo-translations/babelon/hp-es.babelon.tsv
+    """
+    if not babelon_path.exists():
+        log.warning("no Spanish HPO labels at %s — symptom names "
+                    "will fall back to translation", babelon_path)
+        return {}
+
+    labels: dict[str, str] = {}
+    with babelon_path.open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            if row.get("predicate_id") != "rdfs:label":
+                continue
+            subject = (row.get("subject_id") or "").strip()
+            value = (row.get("translation_value") or "").strip()
+            if subject and value:
+                labels[subject] = value
+
+    log.info("official Spanish HPO labels: %d", len(labels))
+    return labels

@@ -80,6 +80,7 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
 
     universe = hpo.read_gene_universe(phenotype_to_genes)
     labels = hpo.read_hpo_labels(obo)
+    spanish_labels = hpo.read_spanish_labels(data_dir / "hp-es.babelon.tsv")
     expected = hpo.read_expected_symptoms(hpoa, labels)
 
     session = sources._session(ncbi_api_key)
@@ -200,7 +201,8 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
                 needed.append(clean_source_text(disease.get("descripcion") or ""))
             for omim in profile.codigo_omim:
                 for symptom in expected.get(f"OMIM:{omim}", []):
-                    needed.append(symptom.label_en)
+                    if symptom.hpo_id not in spanish_labels:
+                        needed.append(symptom.label_en)
         translator.translate_many(needed)
 
     # Pass 3 — assemble rows from the translated cache.
@@ -247,7 +249,8 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
         for omim in profile.codigo_omim:
             for order, symptom in enumerate(expected.get(f"OMIM:{omim}", [])):
                 sintomas.append((
-                    omim, symptom.hpo_id, symptom.label_en, es(symptom.label_en),
+                    omim, symptom.hpo_id, symptom.label_en,
+                    spanish_labels.get(symptom.hpo_id) or es(symptom.label_en),
                     symptom.frequency_raw, symptom.frequency_pct,
                     symptom.frequency_label, order,
                 ))
