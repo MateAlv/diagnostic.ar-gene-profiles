@@ -1,5 +1,6 @@
 # The database is built locally and copied to the server with scp — never committed.
 *.db
+*.db-*
 *.db-journal
 *.sqlite
 
