@@ -17,6 +17,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
+NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 UNIPROT_SEARCH = "https://rest.uniprot.org/uniprotkb/search"
 
@@ -163,3 +164,34 @@ def fetch_uniprot(symbol: str, session: requests.Session,
         "codigo_omim": omim,
         "referencia": f"https://www.uniprot.org/uniprotkb/{accession}" if accession else "",
     }
+
+
+def resolve_symbols(symbols: Iterable[str], session: requests.Session,
+                    *, throttle: float = 0.34) -> dict[str, str]:
+    """Resolve gene symbols to NCBI gene ids.
+
+    Needed for genes the model ranks that carry no HPO annotation, so their id
+    cannot be read out of the annotation files.
+    """
+    resolved: dict[str, str] = {}
+    pending = [s.strip().upper() for s in symbols if s.strip()]
+
+    for index, symbol in enumerate(pending, start=1):
+        try:
+            payload = _get_json(session, NCBI_ESEARCH, {
+                "db": "gene",
+                "term": f"{symbol}[sym] AND human[orgn]",
+                "retmode": "json",
+            })
+            ids = (payload.get("esearchresult") or {}).get("idlist") or []
+            if ids:
+                resolved[symbol] = str(ids[0])
+            else:
+                log.warning("no NCBI gene id for symbol %s", symbol)
+        except FetchError as exc:
+            log.warning("symbol lookup failed for %s: %s", symbol, exc)
+        if index % 50 == 0:
+            log.info("resolved %d/%d symbols", index, len(pending))
+        time.sleep(throttle)
+
+    return resolved

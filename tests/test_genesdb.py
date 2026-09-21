@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from genesdb.build import read_model_genes  # noqa: E402
 from genesdb.hpo import _parse_frequency, read_hpo_version  # noqa: E402
 from genesdb.query import GeneProfileDB  # noqa: E402
 from genesdb.schema import create_schema, write_build_info  # noqa: E402
@@ -117,3 +118,42 @@ def test_read_hpo_version(tmp_path: Path) -> None:
     hpoa = tmp_path / "phenotype.hpoa"
     hpoa.write_text("#description: x\n#version: 2026-06-23\ndatabase_id\tdisease_name\n")
     assert read_hpo_version(hpoa) == "2026-06-23"
+
+
+def test_read_model_genes_drops_the_placeholder_class(tmp_path: Path) -> None:
+    """genes.json's leading "-" is the placeholder class, not a gene."""
+    path = tmp_path / "genes.json"
+    path.write_text(json.dumps(["-", "CFTR", "med16", " ", "ABCC4"]))
+    assert read_model_genes(path) == ["CFTR", "MED16", "ABCC4"]
+
+
+# --- plain-language rewrite -------------------------------------------------
+
+from genesdb.plain_language import MAX_CHARS, validate  # noqa: E402
+
+
+def test_validate_accepts_a_plain_description() -> None:
+    ok, _ = validate("Este gen contiene las instrucciones para fabricar una "
+                     "proteína que funciona como un canal para el paso de sales.")
+    assert ok
+
+
+@pytest.mark.parametrize("text", [
+    "Este gen confirma el diagnóstico de fibrosis quística.",
+    "El pronóstico depende de la mutación.",
+    "Existe tratamiento disponible para esta condición.",
+    "Su hijo tiene esta enfermedad.",
+])
+def test_validate_rejects_medical_advice(text: str) -> None:
+    """A gene description must never read as a diagnosis or a prognosis."""
+    ok, reason = validate(text)
+    assert not ok and reason
+
+
+def test_validate_rejects_overlong_text() -> None:
+    ok, reason = validate("a" * (MAX_CHARS + 1))
+    assert not ok and "too long" in reason
+
+
+def test_validate_allows_empty_when_source_is_insufficient() -> None:
+    assert validate("")[0]
