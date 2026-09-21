@@ -1,0 +1,100 @@
+# gene-profiles
+
+Spanish-language gene profiles for [diagnostic.ar](https://diagnosticar.infra.cluster.qb.fcen.uba.ar),
+so a diagnosis result can explain *what a gene means* instead of only naming it.
+
+For each gene the model can rank, this database holds the associated diseases,
+the symptoms reported for those diseases with real frequencies, and — for
+clinicians only — the underlying biochemistry.
+
+> The platform suggests a **speciality to consult, never a diagnosis.** Nothing
+> served from this database may be presented as one.
+
+## The database is never committed
+
+It is built here and copied to the server with `scp`. `*.db` is gitignored, so
+**these scripts are the deliverable** — if they cannot rebuild it, the data is
+unreproducible. Every build records its provenance in a `build_info` table:
+which HPO release, which day, how many genes.
+
+```bash
+pip install -r requirements.txt
+
+python -m genesdb.build \
+  --data-dir ../diagnosticar-question-agent/data \
+  --out genes.db \
+  --reuse genes_v4.db        # reuses ~10k existing translations, much faster
+
+scp genes.db nodo0-diagnostic.ar:~/…            # deploy is a copy, nothing more
+```
+
+Useful flags: `--only CFTR MED16` and `--limit N` for smoke tests,
+`--skip-translation` for fast structural checks, `--ncbi-api-key` to raise the
+NCBI rate limit from 3/s to 10/s.
+
+### Where the data comes from
+
+| Source | Gives |
+|---|---|
+| `phenotype_to_genes.txt` (HPO) | the gene universe + `ncbi_gene_id` |
+| NCBI Gene (E-utilities) | name, chromosome, location, aliases, summary |
+| UniProtKB (reviewed only) | protein function, diseases, OMIM ids |
+| `phenotype.hpoa` + `hp.obo` (HPO) | **expected symptoms with frequencies** |
+
+The HPO files currently live in `../diagnosticar-question-agent/data/`
+(release **2026-06-23**).
+
+Translation to Spanish still goes through an undocumented, unauthenticated
+Google endpoint — the same one that produced the original data. It is isolated
+in `genesdb/translate.py` so it can be replaced without touching the build, and
+translations are cached and reused across rebuilds.
+
+## Two audiences, one call
+
+The default view is for **families**; the technical view is for **clinicians**
+and is returned only when the caller explicitly asks:
+
+```python
+from genesdb.query import GeneProfileDB
+
+db = GeneProfileDB("genes.db")
+
+db.get("CFTR")                      # disease first, no biochemistry
+db.get("CFTR", professional=True)   # adds resumen/función, EN + ES
+db.missing(["CFTR", "MED16"])       # symbols with no profile, for the miss counter
+```
+
+`get()` returns `None` for an unknown gene. **That is expected, not an error** —
+the HPO release the model ranks over can move ahead of the release this database
+was built from. Callers must show the gene without a description rather than
+hiding it or inventing one.
+
+## Layout
+
+```
+genesdb/
+  build.py      orchestration + CLI
+  sources.py    NCBI and UniProt fetch (the stage that was missing)
+  hpo.py        gene universe, HPO labels, expected symptoms
+  translate.py  EN→ES, cached
+  schema.py     tables, layered by audience
+  query.py      read-only access
+tests/          17 tests, no network
+legacy/         the original scripts, kept for reference — see below
+```
+
+`legacy/crear_db.py` could not rebuild anything: its path constants were empty
+and the per-gene JSON files it expected are not in this repository. The script
+that actually queried NCBI/UniProt/OMIM never existed here, which is why the
+fetch stage had to be written from scratch.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+No network calls, so this is CI-safe. The audience-separation tests are
+mutation-checked: removing the `professional` gate in `query.py` makes
+`test_family_view_excludes_biochemistry` fail.
