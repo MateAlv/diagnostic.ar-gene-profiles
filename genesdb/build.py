@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import hpo, sources
 from .schema import create_schema, write_build_info
-from .translate import Translator, clean_source_text
+from .translate import BulkTranslator, clean_source_text
 
 log = logging.getLogger("genesdb.build")
 
@@ -66,7 +66,8 @@ def _existing_translations(path: Path) -> dict[str, str]:
 def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
           only: list[str] | None = None, reuse: Path | None = None,
           ncbi_api_key: str | None = None, skip_translation: bool = False,
-          model_genes: Path | None = None) -> None:
+          model_genes: Path | None = None, workers: int = 6,
+          translate_rate: float = 8.0) -> None:
     phenotype_to_genes = data_dir / "phenotype_to_genes.txt"
     hpoa = data_dir / "phenotype.hpoa"
     obo = data_dir / "hp.obo"
@@ -110,7 +111,10 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
     by_ncbi = sources.fetch_ncbi(universe.values(), session)
     log.info("NCBI returned %d/%d genes", len(by_ncbi), len(universe))
 
-    translator = Translator(cache=_existing_translations(reuse) if reuse else {})
+    translator = BulkTranslator(
+        cache=_existing_translations(reuse) if reuse else {},
+        workers=workers, rate_per_second=translate_rate,
+    )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
@@ -118,10 +122,12 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
     conn = sqlite3.connect(out_path)
     create_schema(conn)
 
-    symbol_to_ncbi = {sym: nid for sym, nid in universe.items()}
-    rows, sintomas, done, failures = [], [], 0, 0
+    # Pass 1 — gather every gene's source data and every string needing translation.
+    log.info("fetching UniProt for %d genes", len(universe))
+    gathered: list[tuple[str, sources.GeneProfile]] = []
+    failures = 0
 
-    for symbol, ncbi_id in symbol_to_ncbi.items():
+    for index, (symbol, ncbi_id) in enumerate(universe.items(), start=1):
         profile = by_ncbi.get(ncbi_id)
         if profile is None:
             profile = sources.GeneProfile(simbolo=symbol, ncbi_id=ncbi_id)
@@ -142,13 +148,35 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
             if uni.get("referencia"):
                 profile.referencias["UniProt"] = uni["referencia"]
 
+        gathered.append((symbol, profile))
+        if index % 250 == 0:
+            log.info("UniProt %d/%d", index, len(universe))
+
+    # Pass 2 — one deduplicated translation pass over everything at once.
+    if not skip_translation:
+        needed: list[str] = []
+        for _, profile in gathered:
+            needed.append(clean_source_text(profile.resumen))
+            needed.append(clean_source_text(profile.funcion_proteina))
+            for disease in profile.enfermedades_asociadas:
+                needed.append((disease.get("nombre") or "").strip())
+                needed.append(clean_source_text(disease.get("descripcion") or ""))
+            for omim in profile.codigo_omim:
+                for symptom in expected.get(f"OMIM:{omim}", []):
+                    needed.append(symptom.label_en)
+        translator.translate_many(needed)
+
+    # Pass 3 — assemble rows from the translated cache.
+    def es(text: str) -> str:
+        text = (text or "").strip()
+        return text if skip_translation else translator.get(text)
+
+    rows, sintomas, done = [], [], 0
+
+    for symbol, profile in gathered:
         resumen_en = clean_source_text(profile.resumen)
         funcion_en = clean_source_text(profile.funcion_proteina)
-        if skip_translation:
-            resumen_es, funcion_es = resumen_en, funcion_en
-        else:
-            resumen_es = translator.translate(resumen_en)
-            funcion_es = translator.translate(funcion_en)
+        resumen_es, funcion_es = es(resumen_en), es(funcion_en)
 
         enfermedades_es = []
         for disease in profile.enfermedades_asociadas:
@@ -157,8 +185,8 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
             if not nombre and not desc:
                 continue
             enfermedades_es.append({
-                "nombre": nombre if skip_translation else translator.translate(nombre),
-                "descripcion_es": desc if skip_translation else translator.translate(desc),
+                "nombre": es(nombre),
+                "descripcion_es": es(desc),
                 "omim": (disease.get("omim") or "").strip(),
             })
 
@@ -181,17 +209,16 @@ def build(data_dir: Path, out_path: Path, *, limit: int | None = None,
 
         for omim in profile.codigo_omim:
             for order, symptom in enumerate(expected.get(f"OMIM:{omim}", [])):
-                label_es = "" if skip_translation else translator.translate(symptom.label_en)
                 sintomas.append((
-                    omim, symptom.hpo_id, symptom.label_en, label_es,
+                    omim, symptom.hpo_id, symptom.label_en, es(symptom.label_en),
                     symptom.frequency_raw, symptom.frequency_pct,
                     symptom.frequency_label, order,
                 ))
 
         done += 1
-        if done % 100 == 0:
+        if done % 250 == 0:
             _flush(conn, rows, sintomas)
-            log.info("%d/%d genes", done, len(symbol_to_ncbi))
+            log.info("wrote %d/%d genes", done, len(gathered))
 
     _flush(conn, rows, sintomas)
 
@@ -242,6 +269,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-genes", type=Path,
                         help="genes.json from the GenPhenAI checkpoint — the authoritative "
                              "gene vocabulary; without it the HPO annotation files are used")
+    parser.add_argument("--workers", type=int, default=6,
+                        help="concurrent translation requests (default 6)")
+    parser.add_argument("--translate-rate", type=float, default=8.0,
+                        help="max translation requests per second across all workers")
     parser.add_argument("--skip-translation", action="store_true",
                         help="keep English text; for fast structural testing")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -253,7 +284,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     build(args.data_dir, args.out, limit=args.limit, only=args.only, reuse=args.reuse,
           ncbi_api_key=args.ncbi_api_key, skip_translation=args.skip_translation,
-          model_genes=args.model_genes)
+          model_genes=args.model_genes, workers=args.workers,
+          translate_rate=args.translate_rate)
     return 0
 
 

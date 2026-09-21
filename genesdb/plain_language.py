@@ -19,6 +19,8 @@ import logging
 import re
 import sqlite3
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .codex import CodexError, complete
@@ -27,26 +29,43 @@ log = logging.getLogger("genesdb.plain_language")
 
 MAX_CHARS = 300
 
+BATCH_SIZE = 25
+
 SCHEMA = {
     "type": "object",
-    "properties": {"resumen_llano_es": {"type": "string"}},
-    "required": ["resumen_llano_es"],
+    "properties": {
+        "genes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "simbolo": {"type": "string"},
+                    "resumen_llano_es": {"type": "string"},
+                },
+                "required": ["simbolo", "resumen_llano_es"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["genes"],
     "additionalProperties": False,
 }
 
-PROMPT = """Sos un divulgador médico. Reescribí la descripción técnica de este gen en \
-español rioplatense claro, para una familia sin formación médica que está buscando un \
-diagnóstico para su hijo.
+PROMPT = """Sos un divulgador médico. Reescribí la descripción técnica de CADA UNO de \
+estos genes en español rioplatense claro, para una familia sin formación médica que está \
+buscando un diagnóstico para su hijo.
 
-Reglas estrictas:
+Reglas estrictas para cada gen:
 - Máximo 2 oraciones, menos de {max_chars} caracteres.
 - Explicá qué hace el gen en el cuerpo, en lenguaje cotidiano. Evitá jerga (no digas \
 'casete de unión a ATP', 'fosforilación', 'dominio regulador').
 - NO menciones diagnóstico, pronóstico, tratamiento ni probabilidad de enfermedad.
-- NO inventes nada que no esté en el texto técnico.
-- Si el texto técnico está vacío o no alcanza, devolvé string vacío.
+- NO inventes nada que no esté en el texto técnico de ESE gen.
+- Si el texto técnico está vacío o no alcanza, devolvé string vacío para ese gen.
 
-Datos del gen:
+Devolvé una entrada por cada gen recibido, con su símbolo exacto. Son {count} genes.
+
+Genes:
 {payload}"""
 
 # Words that would turn a description into medical advice.
@@ -70,34 +89,55 @@ def validate(text: str) -> tuple[bool, str]:
     return True, ""
 
 
-def rewrite_one(row: sqlite3.Row, *, model: str | None = None,
-                timeout: int = 180) -> str | None:
-    technical = (row["tecnico_resumen_es"] or "").strip()
-    if not technical:
-        return None
+def rewrite_batch(rows: list[sqlite3.Row], *, model: str | None = None,
+                  timeout: int = 600) -> dict[str, str]:
+    """Rewrite a batch of genes in one call, returning {symbol: text}.
 
-    payload = json.dumps({
+    Batching is what makes a full run practical: one call per gene would be
+    ~19 hours, and the per-call overhead dominates the actual work.
+    """
+    payload = json.dumps([{
         "simbolo": row["simbolo"],
         "nombre_completo": row["nombre_completo"],
-        "resumen_tecnico": technical[:900],
-        "enfermedades": [d.get("nombre", "") for d in json.loads(row["enfermedades_es"] or "[]")],
-    }, ensure_ascii=False)
+        "resumen_tecnico": (row["tecnico_resumen_es"] or "").strip()[:700],
+        "enfermedades": [d.get("nombre", "") for d in json.loads(row["enfermedades_es"] or "[]")][:3],
+    } for row in rows], ensure_ascii=False)
 
     response = complete(
-        PROMPT.format(max_chars=MAX_CHARS, payload=payload),
+        PROMPT.format(max_chars=MAX_CHARS, count=len(rows), payload=payload),
         SCHEMA, model=model, timeout=timeout,
     )
-    text = (response.get("resumen_llano_es") or "").strip()
 
-    ok, reason = validate(text)
-    if not ok:
-        log.warning("%s: rejected — %s", row["simbolo"], reason)
-        return None
-    return text
+    wanted = {row["simbolo"] for row in rows}
+    out: dict[str, str] = {}
+    for item in response.get("genes", []):
+        symbol = (item.get("simbolo") or "").strip().upper()
+        text = (item.get("resumen_llano_es") or "").strip()
+        if symbol not in wanted:
+            log.warning("model returned an unrequested gene %r — ignored", symbol)
+            continue
+        ok, reason = validate(text)
+        if not ok:
+            log.warning("%s: rejected — %s", symbol, reason)
+            continue
+        if text:
+            out[symbol] = text
+
+    if len(out) < len(rows):
+        log.debug("batch returned %d/%d usable rewrites", len(out), len(rows))
+    return out
 
 
 def run(db_path: Path, *, limit: int | None = None, only: list[str] | None = None,
-        model: str | None = None, overwrite: bool = False) -> None:
+        model: str | None = None, overwrite: bool = False,
+        batch_size: int = BATCH_SIZE, workers: int = 3) -> None:
+    """Fill `resumen_llano_es`, additively.
+
+    Only that one column is ever written. Nothing already in the database is
+    removed or overwritten — a gene that already has a rewrite is skipped
+    unless `overwrite` is passed, and a rejected rewrite leaves the column
+    untouched rather than blanking it.
+    """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
@@ -113,31 +153,41 @@ def run(db_path: Path, *, limit: int | None = None, only: list[str] | None = Non
         query += f" LIMIT {int(limit)}"
 
     rows = conn.execute(query, params).fetchall()
-    log.info("%d genes to rewrite", len(rows))
+    if not rows:
+        log.info("nothing to do")
+        conn.close()
+        return
 
-    done = skipped = failed = 0
-    for index, row in enumerate(rows, start=1):
+    batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
+    log.info("%d genes in %d batches of %d, %d workers",
+             len(rows), len(batches), batch_size, workers)
+
+    written = failed = 0
+    started = time.monotonic()
+
+    def work(batch: list[sqlite3.Row]) -> dict[str, str]:
         try:
-            text = rewrite_one(row, model=model)
+            return rewrite_batch(batch, model=model)
         except CodexError as exc:
-            log.warning("%s: codex failed — %s", row["simbolo"], exc)
-            failed += 1
-            continue
+            log.warning("batch failed — %s", exc)
+            return {}
 
-        if text is None:
-            skipped += 1
-            continue
-
-        conn.execute("UPDATE genes SET resumen_llano_es = ? WHERE simbolo = ?",
-                     (text, row["simbolo"]))
-        done += 1
-        if done % 20 == 0:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for index, result in enumerate(pool.map(work, batches), start=1):
+            if not result:
+                failed += 1
+            for symbol, text in result.items():
+                conn.execute("UPDATE genes SET resumen_llano_es = ? WHERE simbolo = ?",
+                             (text, symbol))
+                written += 1
             conn.commit()
-            log.info("%d/%d written (%d skipped, %d failed)", index, len(rows), skipped, failed)
+            rate = index / max(time.monotonic() - started, 1e-9)
+            eta = (len(batches) - index) / rate / 60 if rate else 0
+            log.info("batch %d/%d — %d written, %d failed, ~%.0f min left",
+                     index, len(batches), written, failed, eta)
 
-    conn.commit()
     conn.close()
-    log.info("done: %d written, %d skipped, %d failed", done, skipped, failed)
+    log.info("done: %d written, %d batches failed", written, failed)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -148,12 +198,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model")
     parser.add_argument("--overwrite", action="store_true",
                         help="redo genes that already have a rewrite")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help=f"genes per codex call (default {BATCH_SIZE})")
+    parser.add_argument("--workers", type=int, default=3,
+                        help="concurrent codex calls (default 3)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
-    run(args.db, limit=args.limit, only=args.only, model=args.model, overwrite=args.overwrite)
+    run(args.db, limit=args.limit, only=args.only, model=args.model,
+        overwrite=args.overwrite, batch_size=args.batch_size, workers=args.workers)
     return 0
 
 
