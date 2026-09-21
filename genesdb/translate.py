@@ -8,12 +8,14 @@ data, but it is isolated here so it can be swapped without touching the build.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import random
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import requests
 
@@ -135,15 +137,28 @@ class BulkTranslator:
     """
 
     def __init__(self, cache: dict[str, str] | None = None, *,
-                 workers: int = 6, rate_per_second: float = 8.0,
-                 max_failures: int = 40):
+                 workers: int = 2, rate_per_second: float = 2.0,
+                 max_failures: int = 40, cache_path: "Path | None" = None):
         self.cache = cache if cache is not None else {}
         self.workers = workers
         self.limiter = RateLimiter(rate_per_second)
         self.max_failures = max_failures
+        self.cache_path = cache_path
         self._failures = 0
+        self._consecutive_throttles = 0
+        self._blocked = False
         self._lock = threading.Lock()
         self._local = threading.local()
+
+    def save(self) -> None:
+        """Persist the cache so an interrupted run resumes instead of restarting."""
+        if not self.cache_path:
+            return
+        try:
+            self.cache_path.write_text(
+                json.dumps(self.cache, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            log.warning("could not write translation cache: %s", exc)
 
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -167,7 +182,22 @@ class BulkTranslator:
                 if response.status_code == 200:
                     parts = response.json()[0]
                     return html.unescape("".join(p[0] for p in parts if p and p[0]))
+                if response.status_code == 200:
+                    with self._lock:
+                        self._consecutive_throttles = 0
                 if response.status_code in (429, 403) or response.status_code >= 500:
+                    with self._lock:
+                        self._consecutive_throttles += 1
+                        # Sustained 429s mean the IP is blocked, not that we are
+                        # momentarily too fast. Backing off further just burns
+                        # hours; stop and let the caller resume later.
+                        if self._consecutive_throttles >= 60 and not self._blocked:
+                            self._blocked = True
+                            log.error("the translation endpoint is refusing requests "
+                                      "(%d consecutive). Stopping; rerun later to resume "
+                                      "from the cache.", self._consecutive_throttles)
+                    if self._blocked:
+                        raise RuntimeError("translation endpoint blocked")
                     log.warning("translate throttled (HTTP %d), backing off %.0fs",
                                 response.status_code, delay)
                     time.sleep(delay)
@@ -192,7 +222,9 @@ class BulkTranslator:
         log.info("translating %d new strings (%d already cached), %d workers",
                  len(pending), len(self.cache), self.workers)
 
-        def work(text: str) -> tuple[str, str]:
+        def work(text: str) -> tuple[str, str] | None:
+            if self._blocked:
+                return None
             try:
                 return text, self._fetch(text)
             except Exception:  # noqa: BLE001 - counted, then degrades to source text
@@ -202,15 +234,24 @@ class BulkTranslator:
                         log.error("%d translation failures — the endpoint is likely "
                                   "blocking us; remaining text stays in English",
                                   self._failures)
-                return text, text
+                return None if self._blocked else (text, text)
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            for index, (source, translated) in enumerate(pool.map(work, pending), start=1):
+            for index, result in enumerate(pool.map(work, pending), start=1):
+                if result is None:
+                    continue
+                source, translated = result
                 self.cache[source] = translated
-                if index % 500 == 0:
+                if index % 200 == 0:
+                    self.save()
                     log.info("translated %d/%d", index, len(pending))
 
-        if self._failures:
+        self.save()
+        if self._blocked:
+            remaining = len(pending) - sum(1 for t in pending if t in self.cache)
+            log.error("stopped while blocked: %d strings still untranslated. "
+                      "Rerun later — the cache resumes where this left off.", remaining)
+        elif self._failures:
             log.warning("%d/%d strings could not be translated", self._failures, len(pending))
         return self.cache
 
