@@ -1,0 +1,12 @@
+# The database is built locally and copied to the server with scp — never committed.
+*.db
+*.db-journal
+*.sqlite
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
