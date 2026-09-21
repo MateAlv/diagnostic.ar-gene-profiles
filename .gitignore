@@ -15,3 +15,9 @@ venv/
 # Build caches — regenerable, and large
 *.fetch.json
 *.translations.json
+
+# Review samples are generated per build, and the verdicts are yours
+review/
+
+# Unrelated files that happen to sit in this folder
+*.xlsx
