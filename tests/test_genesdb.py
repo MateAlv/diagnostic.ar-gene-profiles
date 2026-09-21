@@ -248,3 +248,23 @@ def test_match_symptoms_gene_without_diseases_is_not_an_error(tmp_path: Path) ->
 
     result = GeneProfileDB(path).match_symptoms("XYZ", ["HP:0012236"])
     assert result == {"matched": [], "unreported": [], "reported_count": 1, "expected_count": 0}
+
+
+def test_read_spanish_labels_keeps_only_term_names(tmp_path: Path) -> None:
+    """The babelon file carries definitions and synonyms too; we want labels."""
+    from genesdb.hpo import read_spanish_labels
+
+    path = tmp_path / "hp-es.babelon.tsv"
+    path.write_text(
+        "subject_id\tpredicate_id\ttranslation_value\n"
+        "HP:0002110\trdfs:label\tBronquiectasias\n"
+        "HP:0002110\tIAO:0000115\tUna descripción larga\n"
+        "HP:0001250\trdfs:label\tConvulsiones\n",
+        encoding="utf-8")
+    assert read_spanish_labels(path) == {
+        "HP:0002110": "Bronquiectasias", "HP:0001250": "Convulsiones"}
+
+
+def test_read_spanish_labels_missing_file_is_not_fatal(tmp_path: Path) -> None:
+    from genesdb.hpo import read_spanish_labels
+    assert read_spanish_labels(tmp_path / "absent.tsv") == {}

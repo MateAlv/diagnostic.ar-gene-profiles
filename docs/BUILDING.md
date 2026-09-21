@@ -32,43 +32,85 @@ the build resolves their symbols through NCBI esearch. All 126 resolve.
 **When GenPhenAI is retrained the vocabulary changes.** Copy the new
 `genes.json` and rebuild, or the two drift apart again.
 
+## Translation: use the official labels, not the web endpoint
+
+A build was rate-limited to a standstill on 2026-09-21: 1,020 HTTP 429s, then
+the endpoint refused every request from this IP for over half an hour. The
+cause was volume — roughly 20,000 HPO symptom labels, none of them cached.
+
+**That volume is now avoidable.** The HPO Internationalisation Effort publishes
+human-curated Spanish labels covering **97.6% of HPO terms** (19,932 of 20,413,
+all marked `OFFICIAL`):
+
+```bash
+scripts/fetch_hpo_translations.sh
+```
+
+This drops the per-build translation load from ~20,413 strings to **481**, and
+the labels are better than machine output — *Failure to thrive* becomes
+*Retraso en el medro*, the term a clinician would use, rather than a literal
+rendering.
+
+The build prefers an official label whenever one exists and only falls back to
+translation for the remainder. Run the fetch script before a build; without the
+file the build still works, it is just slow and liable to be throttled again.
+
+### Can the translation endpoint be authorised?
+
+Short answer: **the web endpoint cannot be, and now barely matters.**
+
+`translate.googleapis.com/translate_a/single?client=gtx` is the undocumented
+endpoint the browser widget uses. It takes no API key — there is no header or
+parameter that raises its limits, because it was never meant to be called
+directly. Being blocked is the expected outcome of using it at volume, and no
+amount of configuration changes that.
+
+If the remaining 481 strings ever become a problem, the real options are:
+
+| Option | Cost | Notes |
+|---|---|---|
+| **Official HPO labels** | free | already covers 97.6%; do this first |
+| **Google Cloud Translation API** | ~$20 per million chars | a real key, real quotas, no blocking |
+| **Local model via Ollama** | free | `qwen3.5:4b` is on this box; slower, needs review |
+| **Wait it out** | free | the block is temporary; the build resumes from cache |
+
+A paid key is only worth it if translation becomes a recurring bottleneck. With
+the official labels in place, a full build now needs a few hundred calls, which
+is well inside what the endpoint tolerates.
+
 ## Timing and rate limits
 
 A full build is roughly **50–70 minutes**, almost entirely network-bound.
 
 | Stage | Cost | Notes |
 |---|---|---|
-| NCBI esummary | ~2 min | batched 200 ids per request, ~3 req/s |
+| NCBI esummary | ~2 min | batched 200 ids per request |
 | NCBI esearch (126 symbols) | ~1 min | only for genes absent from HPO |
-| UniProt | ~1 min | ~0.6 s/gene measured |
-| Translation | ~45 min | the dominant cost |
+| UniProt | ~35 min | one request per gene |
+| Translation | a few min | with official labels; ~45 min without |
 
-Translation dominates because the **~20,000 distinct HPO symptom labels** have
-never been translated before, while gene summaries are largely served from
-cache. The build therefore:
-
-1. gathers every string that needs translating across all genes,
-2. **deduplicates** them — symptom labels repeat heavily across diseases,
-3. translates them concurrently under a shared rate limiter,
-4. then assembles the rows from the finished cache.
-
-Measured at **7.3 requests/second** with 6 workers and no throttling. The
-endpoint is undocumented and unauthenticated, so the defaults stay well under
-what it tolerates:
+The defaults are deliberately conservative after the block:
 
 ```
---workers 6            # concurrent requests
---translate-rate 8     # hard ceiling, requests/second across all workers
+--workers 2            # concurrent requests
+--translate-rate 2     # hard ceiling, requests/second across all workers
 ```
 
 A token-bucket limiter with jitter enforces the ceiling across threads, and the
-client backs off exponentially (2s → 60s) on HTTP 429, 403 or 5xx. If a string
-still cannot be translated it **falls back to the English source** rather than
-leaving the field blank, and the build logs how many. Raising these numbers
-risks getting the endpoint blocked; there is no reason to.
+client backs off exponentially (2s → 60s) on 429, 403 or 5xx. **Sustained
+throttling is treated as a block rather than as slowness:** after 60
+consecutive rejections the stage stops and reports what remains, because
+backing off further cannot fix a block.
 
-`--reuse genes_v4.db` seeds the cache with ~10,000 translations from a previous
-build and is worth passing every time.
+### Builds resume
+
+Both the fetched source data and the translations are cached to disk next to
+the output (`genes.fetch.json`, `genes.translations.json`) and reloaded on the
+next run. An interrupted build picks up where it stopped rather than repeating
+~35 minutes of NCBI and UniProt work. Both are gitignored.
+
+`--reuse genes_v4.db` additionally seeds ~10,000 translations from a previous
+build.
 
 ### Other flags
 
