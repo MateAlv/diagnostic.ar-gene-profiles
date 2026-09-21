@@ -68,6 +68,55 @@ class GeneProfileDB:
 
         return profile
 
+    def match_symptoms(self, symbol: str, reported_hpo_ids: list[str], *,
+                       limit_unreported: int = 5) -> dict[str, Any] | None:
+        """Compare what the patient reported against what this gene's diseases show.
+
+        Returns the overlap and, more usefully, the frequent phenotypes the
+        patient has *not* reported — the things worth asking a doctor about.
+
+        This is our own computation over HPO annotations. The model does not
+        say why it ranked a gene (`matched_hpo_ids` is always empty), so this
+        must never be presented as the model's reasoning.
+        """
+        row = self._conn.execute(
+            "SELECT codigo_omim FROM genes WHERE simbolo = ?", (symbol.strip().upper(),)
+        ).fetchone()
+        if row is None:
+            return None
+
+        omim_codes = json.loads(row["codigo_omim"] or "[]")
+        if not omim_codes:
+            return {"matched": [], "unreported": [], "reported_count": len(reported_hpo_ids),
+                    "expected_count": 0}
+
+        placeholders = ",".join("?" * len(omim_codes))
+        # A phenotype can appear under several of a gene's diseases; keep the
+        # highest reported frequency so a symptom is never understated.
+        rows = self._conn.execute(
+            f"""SELECT hpo_id, label_es, label_en, frecuencia_pct, frecuencia_es, frecuencia_raw,
+                       MAX(COALESCE(frecuencia_pct, -1)) AS best
+                FROM sintomas_esperados WHERE omim IN ({placeholders})
+                GROUP BY hpo_id ORDER BY best DESC""", omim_codes).fetchall()
+
+        reported = {h.strip().upper() for h in reported_hpo_ids}
+        matched, unreported = [], []
+        for r in rows:
+            entry = {
+                "hpo_id": r["hpo_id"],
+                "nombre": r["label_es"] or r["label_en"],
+                "frecuencia_pct": r["frecuencia_pct"],
+                "frecuencia_texto": r["frecuencia_es"] or r["frecuencia_raw"],
+            }
+            (matched if r["hpo_id"].upper() in reported else unreported).append(entry)
+
+        return {
+            "matched": matched,
+            "unreported": [u for u in unreported if u["frecuencia_pct"]][:limit_unreported],
+            "reported_count": len(reported),
+            "expected_count": len(rows),
+        }
+
     def expected_symptoms(self, omim_codes: list[str], *, limit: int = 15) -> list[dict[str, Any]]:
         """Symptoms reported for these diseases, most frequent first."""
         if not omim_codes:
