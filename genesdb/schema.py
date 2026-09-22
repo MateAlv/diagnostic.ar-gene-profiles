@@ -51,6 +51,27 @@ CREATE TABLE IF NOT EXISTS sintomas_esperados (
 
 CREATE INDEX IF NOT EXISTS idx_sintomas_omim ON sintomas_esperados(omim);
 
+-- Ancestor closure over HPO's is_a graph, used to match a reported phenotype
+-- against the more specific ones a disease is annotated with.
+--
+-- Families describe symptoms in general language and the extractor returns
+-- general terms ("Convulsiones"), while disease annotations are specific
+-- ("Espasmos infantiles"). An exact id comparison never fires, so every gene
+-- reads "sin coincidencias". One row per (specific term, general ancestor)
+-- pair, with the hop distance between them.
+--
+-- Bounded at MAX_ANCESTOR_DEPTH hops: a match two or three steps down is a
+-- real clinical relationship, while an unbounded walk reaches "Phenotypic
+-- abnormality" and makes everything match everything.
+CREATE TABLE IF NOT EXISTS hpo_ancestros (
+    hpo_id      TEXT NOT NULL,   -- the specific term a disease is annotated with
+    ancestro_id TEXT NOT NULL,   -- a more general term that subsumes it
+    distancia   INTEGER NOT NULL,
+    PRIMARY KEY (hpo_id, ancestro_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ancestros_ancestro ON hpo_ancestros(ancestro_id);
+
 -- One row. Records what this database was built from.
 CREATE TABLE IF NOT EXISTS build_info (
     clave TEXT PRIMARY KEY,

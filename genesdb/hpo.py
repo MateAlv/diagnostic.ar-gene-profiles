@@ -158,3 +158,63 @@ def read_spanish_labels(babelon_path: Path) -> dict[str, str]:
 
     log.info("official Spanish HPO labels: %d", len(labels))
     return labels
+
+
+# A reported phenotype matches an annotated one this many is_a hops below it.
+#
+# Measured against real extractor output: depth 3 admits "Espasmos infantiles"
+# and "Convulsiones febriles" under a reported "Convulsiones", which is exactly
+# the relationship a clinician would draw. Depth 4 adds nothing — the useful
+# matches are exhausted — and unbounded reaches "Phenotypic abnormality", whose
+# 18,708 descendants would make every gene match every symptom.
+MAX_ANCESTOR_DEPTH = 3
+
+
+def read_parents(obo_path: Path) -> dict[str, set[str]]:
+    """Map HPO id -> its direct is_a parents."""
+    parents: dict[str, set[str]] = {}
+    current: str | None = None
+    with obo_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if line == "[Term]":
+                current = None
+            elif line.startswith("id: HP:"):
+                current = line[4:].strip()
+            elif line.startswith("is_a: ") and current:
+                parent = line[6:].split("!")[0].strip()
+                if parent:
+                    parents.setdefault(current, set()).add(parent)
+    log.info("HPO graph: %d terms with parents", len(parents))
+    return parents
+
+
+def build_ancestor_closure(
+    parents: dict[str, set[str]],
+    terms: set[str],
+    max_depth: int = MAX_ANCESTOR_DEPTH,
+) -> list[tuple[str, str, int]]:
+    """(term, ancestor, hops) for every term, walking up at most `max_depth`.
+
+    Breadth-first so `hops` is the *shortest* path to each ancestor: HPO is a
+    DAG, not a tree, and a term reachable by both two and four hops is two hops
+    away for our purposes.
+    """
+    rows: list[tuple[str, str, int]] = []
+    for term in terms:
+        seen: dict[str, int] = {}
+        frontier = {term}
+        for distance in range(1, max_depth + 1):
+            nxt: set[str] = set()
+            for node in frontier:
+                for parent in parents.get(node, ()):
+                    if parent not in seen:
+                        seen[parent] = distance
+                        nxt.add(parent)
+            if not nxt:
+                break
+            frontier = nxt
+        rows.extend((term, ancestor, d) for ancestor, d in seen.items())
+    log.info("ancestor closure: %d edges for %d terms (depth %d)",
+             len(rows), len(terms), max_depth)
+    return rows
