@@ -176,6 +176,30 @@ expected-symptom volume, recorded provenance, and how much text still reads as
 English. Thresholds sit just above what a good build produces, so ordinary
 variation passes and a stage that silently did nothing does not.
 
+### The HPO ancestor graph
+
+The database carries a closure over HPO's `is_a` graph (`hpo_ancestros`), which
+is what lets a reported phenotype match the more specific ones a disease is
+annotated with. Without it the results screen reads **"sin coincidencias" on
+every gene**: families write general language, so the extractor returns
+*Convulsiones*, while diseases are annotated with *Espasmos infantiles*.
+
+```bash
+python scripts/add_hpo_graph.py genes.db --obo ../diagnostic.ar-api/data/hpo/hp.obo
+```
+
+Bounded at **three hops**, and the bound is load-bearing. Depth 3 admits
+*Convulsiones febriles* under a reported *Convulsiones*; depth 4 adds nothing;
+unbounded, every term reaches *Phenotypic abnormality* and its 18,708
+descendants, at which point every gene matches every symptom.
+
+A descendant-count cap was tried first and rejected: *Seizure* has 346
+descendants and *Abnormality of the mouth* has 493, so no threshold separates a
+useful clinical finding from a structural category. Hop distance does.
+
+Only the terms diseases are actually annotated with get a closure — 8,728 of
+the ontology's 19,934, about 35,000 edges and 3 MB.
+
 ### Repairing an interrupted translation
 
 The two Spanish columns drift apart independently — a gene can have a Spanish

@@ -74,6 +74,16 @@ def verify(path: Path) -> bool:
     results.append(check("diseases with symptoms", with_symptoms > 5_000,
                          f"{with_symptoms} OMIM codes"))
 
+    # Without the closure a reported "Convulsiones" matches nothing a disease
+    # is annotated with, and the results screen reads "sin coincidencias" on
+    # every gene — which is how it shipped once already.
+    graph = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'hpo_ancestros'"
+    ).fetchone()[0]
+    edges = conn.execute("SELECT COUNT(*) FROM hpo_ancestros").fetchone()[0] if graph else 0
+    results.append(check("HPO ancestor graph", edges > 20_000,
+                         f"{edges} edges" if graph else "table missing — run scripts/add_hpo_graph.py"))
+
     build = dict(conn.execute("SELECT clave, valor FROM build_info").fetchall())
     results.append(check("build provenance", bool(build.get("hpo_version")),
                          build.get("hpo_version") or "no HPO version recorded"))
