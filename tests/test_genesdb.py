@@ -455,3 +455,65 @@ def test_a_hallucinated_id_is_never_written() -> None:
                                   "es": "Este gen codifica un canal de cloruro."}]}
 
     assert translate_summaries._translate_batch(items, model=None, timeout=1, complete=invents) == {}
+
+
+# --- HPO graph closure ------------------------------------------------------
+
+@pytest.fixture
+def toy_parents() -> dict[str, set[str]]:
+    """A slice of HPO's shape: Convulsiones -> generalizadas -> mioclónicas."""
+    return {
+        "HP:0002123": {"HP:0002197"},          # mioclónicas generalizadas
+        "HP:0002197": {"HP:0001250"},          # generalizadas
+        "HP:0001250": {"HP:0012638"},          # Convulsiones
+        "HP:0012638": {"HP:0000707"},
+        "HP:0000707": {"HP:0000118"},          # near-root
+    }
+
+
+def test_closure_records_the_hop_distance(toy_parents) -> None:
+    from genesdb.hpo import build_ancestor_closure
+    edges = {(a, b): d for a, b, d in build_ancestor_closure(toy_parents, {"HP:0002123"})}
+    assert edges[("HP:0002123", "HP:0002197")] == 1
+    assert edges[("HP:0002123", "HP:0001250")] == 2
+
+
+def test_closure_stops_before_the_near_root_terms(toy_parents) -> None:
+    """Unbounded, everything reaches "Phenotypic abnormality" and every gene
+    matches every symptom.
+
+    Deliberately uses the *default* depth rather than passing one: the shipped
+    constant is the thing that has to be safe, and a test that supplies its own
+    bound would pass however the default were changed.
+    """
+    from genesdb.hpo import build_ancestor_closure
+    reached = {a for _, a, _ in build_ancestor_closure(toy_parents, {"HP:0002123"})}
+    assert "HP:0001250" in reached          # Convulsiones, 2 hops — the useful one
+    assert "HP:0000118" not in reached      # Phenotypic abnormality, 5 hops
+
+
+def test_closure_depth_is_configurable(toy_parents) -> None:
+    from genesdb.hpo import build_ancestor_closure
+    shallow = {a for _, a, _ in build_ancestor_closure(toy_parents, {"HP:0002123"}, max_depth=1)}
+    assert shallow == {"HP:0002197"}
+
+
+def test_closure_takes_the_shortest_path(toy_parents) -> None:
+    """HPO is a DAG: a term reachable by both two and four hops is two away."""
+    from genesdb.hpo import build_ancestor_closure
+    parents = dict(toy_parents)
+    parents["HP:0002123"] = {"HP:0002197", "HP:0001250"}  # also a direct edge
+    edges = {(a, b): d for a, b, d in build_ancestor_closure(parents, {"HP:0002123"})}
+    assert edges[("HP:0002123", "HP:0001250")] == 1
+
+
+def test_read_parents_ignores_obsolete_and_blank_lines(tmp_path: Path) -> None:
+    obo = tmp_path / "hp.obo"
+    obo.write_text(
+        "[Term]\nid: HP:0002123\nname: Myoclonic seizure\n"
+        "is_a: HP:0002197 ! Generalized seizure\n\n"
+        "[Typedef]\nid: part_of\nname: part of\n",
+        encoding="utf-8",
+    )
+    from genesdb.hpo import read_parents
+    assert read_parents(obo) == {"HP:0002123": {"HP:0002197"}}
