@@ -15,6 +15,7 @@ venv/
 # Build caches — regenerable, and large
 *.fetch.json
 *.translations.json
+*.summaries.json
 
 # Review samples are generated per build, and the verdicts are yours
 review/

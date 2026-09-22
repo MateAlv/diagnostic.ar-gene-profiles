@@ -20,6 +20,7 @@ from genesdb.hpo import _parse_frequency, read_hpo_version  # noqa: E402
 from genesdb.query import GeneProfileDB  # noqa: E402
 from genesdb.schema import create_schema, write_build_info  # noqa: E402
 from genesdb.translate import clean_source_text  # noqa: E402
+from genesdb import translate_summaries  # noqa: E402
 
 
 @pytest.fixture
@@ -358,3 +359,99 @@ def test_quota_errors_are_distinguishable_from_transient_ones() -> None:
     """Retrying a spent quota only burns minutes rediscovering the same wall."""
     from genesdb.codex import CodexError, CodexQuotaError
     assert issubclass(CodexQuotaError, CodexError)
+
+
+# --- Finding the texts an interrupted build left in English -----------------
+
+def test_looks_english_separates_the_two_languages() -> None:
+    english = ("The protein encoded by this gene is a member of the superfamily "
+               "of ATP-binding cassette transporters.")
+    spanish = ("La proteína codificada por este gen es miembro de la superfamilia "
+               "de transportadores con cassette de unión a ATP.")
+    assert translate_summaries.looks_english(english)
+    assert not translate_summaries.looks_english(spanish)
+
+
+@pytest.mark.parametrize("text", [None, "", "   "])
+def test_looks_english_ignores_empty_text(text) -> None:
+    """An empty column is missing data, not an untranslated one."""
+    assert not translate_summaries.looks_english(text)
+
+
+def test_looks_english_tolerates_english_technical_terms() -> None:
+    """Spanish molecular biology keeps terms like 'helix-loop-helix' untranslated;
+    a row is not English because it contains them."""
+    text = ("Este gen codifica el factor de transcripción 4, un factor de "
+            "transcripción basic helix-loop-helix que reconoce un sitio E-box.")
+    assert not translate_summaries.looks_english(text)
+
+
+def test_collect_pending_finds_each_column_independently(tmp_path: Path) -> None:
+    """The two columns drift apart: a gene can have a Spanish summary and an
+    English function, or the reverse."""
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, tecnico_resumen_es, tecnico_funcion_es, raw_json)"
+        " VALUES (?, ?, ?, '{}')",
+        ("ACE", "Este gen codifica una enzima que regula la presión arterial.",
+         "Dipeptidyl carboxypeptidase that removes dipeptides from the C-terminus."),
+    )
+    conn.execute(
+        "INSERT INTO genes (simbolo, tecnico_resumen_es, tecnico_funcion_es, raw_json)"
+        " VALUES (?, ?, ?, '{}')",
+        ("TCF4", "This gene encodes transcription factor 4, which binds an E-box.",
+         "Participa en la vía de señalización Wnt y modula la expresión de MYC."),
+    )
+    conn.commit()
+
+    pending = translate_summaries.collect_pending(conn)
+    conn.close()
+
+    assert {(symbol, field) for symbol, field, _ in pending} == {
+        ("ACE", "tecnico_funcion_es"),
+        ("TCF4", "tecnico_resumen_es"),
+    }
+
+
+def test_apply_cache_leaves_untranslated_rows_alone(tmp_path: Path) -> None:
+    """Additive: a row with no translation keeps whatever it had."""
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, tecnico_resumen_es, tecnico_funcion_es, raw_json)"
+        " VALUES ('TCF4', 'This gene encodes transcription factor 4.', 'Vía Wnt.', '{}')"
+    )
+    conn.commit()
+
+    translate_summaries.apply_cache(conn, {"TCF4:tecnico_resumen_es": "Este gen codifica el factor 4."})
+
+    row = conn.execute(
+        "SELECT tecnico_resumen_es, tecnico_funcion_es FROM genes WHERE simbolo = 'TCF4'"
+    ).fetchone()
+    conn.close()
+    assert row == ("Este gen codifica el factor 4.", "Vía Wnt.")
+
+
+def test_a_reply_still_in_english_is_rejected() -> None:
+    """Echoing the source back would hide the row from the next run's detector."""
+    items = [("TCF4", "tecnico_resumen_es", "This gene encodes transcription factor 4.")]
+
+    def echo(prompt, schema, *, model=None, timeout=180):
+        return {"translations": [{"id": "TCF4:tecnico_resumen_es",
+                                  "text": "", "es": "This gene encodes transcription factor 4."}]}
+
+    assert translate_summaries._translate_batch(items, model=None, timeout=1, complete=echo) == {}
+
+
+def test_a_hallucinated_id_is_never_written() -> None:
+    """A key we did not send would otherwise be written to whichever gene it names."""
+    items = [("TCF4", "tecnico_resumen_es", "This gene encodes transcription factor 4.")]
+
+    def invents(prompt, schema, *, model=None, timeout=180):
+        return {"translations": [{"id": "CFTR:tecnico_resumen_es",
+                                  "es": "Este gen codifica un canal de cloruro."}]}
+
+    assert translate_summaries._translate_batch(items, model=None, timeout=1, complete=invents) == {}
