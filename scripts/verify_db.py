@@ -37,6 +37,11 @@ EXPECTED_GENES = 5228
 MAX_ENGLISH = 25
 
 
+def build_info_value(conn: sqlite3.Connection, key: str) -> str:
+    row = conn.execute("SELECT valor FROM build_info WHERE clave = ?", (key,)).fetchone()
+    return row[0] if row else ""
+
+
 def check(name: str, ok: bool, detail: str) -> bool:
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
     return ok
@@ -83,6 +88,20 @@ def verify(path: Path) -> bool:
     edges = conn.execute("SELECT COUNT(*) FROM hpo_ancestros").fetchone()[0] if graph else 0
     results.append(check("HPO ancestor graph", edges > 20_000,
                          f"{edges} edges" if graph else "table missing — run scripts/add_hpo_graph.py"))
+
+    # Gene→disease links come from UniProt, which curates a subset: it knows
+    # TCF4 as a diabetes susceptibility locus and not as the cause of
+    # Pitt-Hopkins, so that gene shipped with 3 expected symptoms instead of
+    # 66. Symptoms join by OMIM code, so a missing code drops every symptom
+    # beneath it silently.
+    #
+    # A short symptom list is not the signal — 630 genes have four or fewer
+    # because their diseases are genuinely thinly annotated, and none of those
+    # have a code left to recover. The signal is a code HPO links to the gene
+    # that we do not hold, which is what scripts/backfill_hpo_diseases.py adds.
+    backfilled = build_info_value(conn, "hpo_disease_backfill")
+    results.append(check("HPO gene-disease backfill", bool(backfilled),
+                         backfilled or "never run — see scripts/backfill_hpo_diseases.py"))
 
     build = dict(conn.execute("SELECT clave, valor FROM build_info").fetchall())
     results.append(check("build provenance", bool(build.get("hpo_version")),

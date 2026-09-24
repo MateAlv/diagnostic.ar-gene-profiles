@@ -517,3 +517,42 @@ def test_read_parents_ignores_obsolete_and_blank_lines(tmp_path: Path) -> None:
     )
     from genesdb.hpo import read_parents
     assert read_parents(obo) == {"HP:0002123": {"HP:0002197"}}
+
+
+# --- The OMIM codes UniProt does not know -----------------------------------
+
+def test_read_gene_diseases_links_genes_to_omim(tmp_path: Path) -> None:
+    """HPO's own gene→disease links, which UniProt's curation omits.
+
+    TCF4 is the case that exposed this: UniProt knows it as a type 2 diabetes
+    susceptibility locus (OMIM 125853) and not as the cause of Pitt-Hopkins
+    syndrome (610954), so the gene shipped with 3 expected symptoms instead of
+    66. Symptoms are joined by OMIM code, so a missing code drops every symptom
+    beneath it silently.
+    """
+    path = tmp_path / "phenotype_to_genes.txt"
+    path.write_text(
+        "hpo_id\thpo_name\tncbi_gene_id\tgene_symbol\tdisease_id\n"
+        "HP:0000582\tUpslanted palpebral fissure\t6925\tTCF4\tOMIM:610954\n"
+        "HP:0000582\tUpslanted palpebral fissure\t6925\tTCF4\tORPHA:2896\n"
+        "HP:0001250\tSeizure\t6925\tTCF4\tOMIM:610954\n",
+        encoding="utf-8",
+    )
+
+    from genesdb.hpo import read_gene_diseases
+    links = read_gene_diseases(path)
+
+    assert links["TCF4"] == {"610954"}, "ORPHA ids are not OMIM codes"
+
+
+def test_read_gene_diseases_ignores_non_omim_identifiers(tmp_path: Path) -> None:
+    path = tmp_path / "phenotype_to_genes.txt"
+    path.write_text(
+        "hpo_id\thpo_name\tncbi_gene_id\tgene_symbol\tdisease_id\n"
+        "HP:0001250\tSeizure\t1\tGENE1\tORPHA:2896\n"
+        "HP:0001250\tSeizure\t1\tGENE1\tDECIPHER:14\n",
+        encoding="utf-8",
+    )
+
+    from genesdb.hpo import read_gene_diseases
+    assert read_gene_diseases(path) == {}
