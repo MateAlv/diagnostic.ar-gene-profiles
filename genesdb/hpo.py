@@ -157,6 +157,19 @@ def read_expected_symptoms(hpoa_path: Path, labels: dict[str, str]) -> dict[str,
     return dict(by_disease)
 
 
+def read_disease_names(hpoa_path: Path) -> dict[str, str]:
+    """Map OMIM number (``"610954"``) -> the English disease name HPO uses."""
+    names: dict[str, str] = {}
+    with hpoa_path.open(encoding="utf-8") as handle:
+        rows = (line for line in handle if not line.startswith("#"))
+        for row in csv.DictReader(rows, delimiter="\t"):
+            disease = (row.get("database_id") or "").strip()
+            name = (row.get("disease_name") or "").strip()
+            if disease.startswith("OMIM:") and name:
+                names.setdefault(disease.removeprefix("OMIM:"), name)
+    return names
+
+
 def read_spanish_labels(babelon_path: Path) -> dict[str, str]:
     """Official Spanish HPO labels from the HPO Internationalisation Effort.
 
