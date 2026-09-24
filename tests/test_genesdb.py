@@ -556,3 +556,67 @@ def test_read_gene_diseases_ignores_non_omim_identifiers(tmp_path: Path) -> None
 
     from genesdb.hpo import read_gene_diseases
     assert read_gene_diseases(path) == {}
+
+
+def _load_script(name: str):
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gene_mim_prefers_the_symbol_over_a_wrong_ncbi_id(tmp_path: Path) -> None:
+    """CNP was stored with NPPC's NCBI id; matching on it opened NPPC's page."""
+    mim2gene = tmp_path / "mim2gene.txt"
+    mim2gene.write_text(
+        "# Generated: 2026-09-24\n"
+        "123830\tgene\t1267\tCNP\tENSG00000173786\n"
+        "600296\tgene\t4880\tNPPC\tENSG00000163273\n"
+        "609279\tgene\t55835\tCPAP\tENSG00000151849\n"
+        "610954\tphenotype\t\t\t\n",
+        encoding="utf-8",
+    )
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    for symbol, ncbi in (("CNP", "4880"), ("CENPJ", "55835"), ("ORPHAN1", "999")):
+        conn.execute(
+            "INSERT INTO genes (simbolo, ncbi_id, raw_json) VALUES (?, ?, '{}')", (symbol, ncbi))
+    conn.commit()
+    conn.close()
+
+    found, total = _load_script("add_gene_mim").run(path, mim2gene)
+
+    conn = sqlite3.connect(path)
+    mims = dict(conn.execute("SELECT simbolo, omim_gen FROM genes"))
+    assert mims == {"CNP": "123830", "CENPJ": "609279", "ORPHAN1": None}
+    assert (found, total) == (2, 3)
+
+
+def test_recovered_codes_become_named_conditions(tmp_path: Path) -> None:
+    """TCF4 listed diabetes alone while its symptoms came from Pitt-Hopkins."""
+    from genesdb.translate import BulkTranslator
+
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, enfermedades_es, codigo_omim, raw_json) VALUES (?, ?, ?, '{}')",
+        ("TCF4",
+         json.dumps([{"nombre": "Diabetes mellitus tipo 2", "descripcion_es": "", "omim": "125853"}]),
+         json.dumps(["125853", "610954", "999999"])),
+    )
+    translator = BulkTranslator(cache={"Pitt-Hopkins syndrome": "Síndrome de Pitt-Hopkins"})
+    names = {"610954": "Pitt-Hopkins syndrome"}
+
+    backfill = _load_script("backfill_hpo_diseases")
+    assert backfill.name_conditions(conn, names, translator) == 1
+    assert backfill.name_conditions(conn, names, translator) == 0, "rerun must add nothing"
+
+    named = json.loads(conn.execute("SELECT enfermedades_es FROM genes").fetchone()[0])
+    assert [(d["nombre"], d["omim"]) for d in named] == [
+        ("Diabetes mellitus tipo 2", "125853"),
+        ("Síndrome de Pitt-Hopkins", "610954"),
+    ], "UniProt's entry stays first; a code HPO cannot name is left out"

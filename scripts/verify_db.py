@@ -20,6 +20,7 @@ variation passes and a stage that silently did nothing does not.
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -35,6 +36,12 @@ EXPECTED_GENES = 5228
 # A handful of texts legitimately read as English — a summary that is mostly a
 # protein name and an accession, for instance. Hundreds do not.
 MAX_ENGLISH = 25
+
+# HPO names every OMIM code it links to a gene, so a good build has none left.
+MAX_UNNAMED = 10
+
+# mim2gene covers 5,225 of the 5,228; the other three have no OMIM gene entry.
+MIN_GENE_MIM = 5200
 
 
 def build_info_value(conn: sqlite3.Connection, key: str) -> str:
@@ -102,6 +109,25 @@ def verify(path: Path) -> bool:
     backfilled = build_info_value(conn, "hpo_disease_backfill")
     results.append(check("HPO gene-disease backfill", bool(backfilled),
                          backfilled or "never run — see scripts/backfill_hpo_diseases.py"))
+
+    # The symptoms of a recovered code arrived without its name, so TCF4's
+    # conditions read "Diabetes mellitus tipo 2" over a screen of Pitt-Hopkins
+    # symptoms. A code with symptoms and no named condition is that again.
+    unnamed = 0
+    for raw_codes, raw_named in conn.execute("SELECT codigo_omim, enfermedades_es FROM genes"):
+        named = {disease.get("omim") for disease in json.loads(raw_named or "[]")}
+        unnamed += sum(1 for code in json.loads(raw_codes or "[]") if code not in named)
+    results.append(check("named conditions", unnamed <= MAX_UNNAMED,
+                         f"{unnamed} OMIM codes with no named condition (limit {MAX_UNNAMED})"
+                         + ("" if unnamed <= MAX_UNNAMED else
+                            " — run scripts/backfill_hpo_diseases.py")))
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(genes)")}
+    gene_mim = (conn.execute("SELECT COUNT(*) FROM genes WHERE omim_gen IS NOT NULL").fetchone()[0]
+                if "omim_gen" in columns else 0)
+    results.append(check("gene OMIM entries", gene_mim >= MIN_GENE_MIM,
+                         f"{gene_mim} genes" if "omim_gen" in columns
+                         else "column missing — run scripts/add_gene_mim.py"))
 
     build = dict(conn.execute("SELECT clave, valor FROM build_info").fetchall())
     results.append(check("build provenance", bool(build.get("hpo_version")),
