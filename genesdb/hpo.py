@@ -60,6 +60,31 @@ def read_gene_universe(phenotype_to_genes: Path) -> dict[str, str]:
     return genes
 
 
+def read_gene_diseases(phenotype_to_genes: Path) -> dict[str, set[str]]:
+    """Return {gene_symbol: {OMIM codes}} as HPO itself links them.
+
+    The disease list comes from UniProt, which curates a *subset*: it knows
+    TCF4 as a type 2 diabetes susceptibility locus and not as the cause of
+    Pitt-Hopkins syndrome, even though HPO annotates Pitt-Hopkins with 63
+    phenotypes and links it to TCF4. Since expected symptoms are joined by OMIM
+    code, a code missing here silently drops every symptom under it — 504 genes
+    (10%) lost at least one, and TCF4 was left with three.
+
+    HPO is the right authority for this link: it is the same file the symptoms
+    themselves come from, so the two sides cannot disagree.
+    """
+    diseases: dict[str, set[str]] = defaultdict(set)
+    with phenotype_to_genes.open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            symbol = (row.get("gene_symbol") or "").strip().upper()
+            disease = (row.get("disease_id") or "").strip()
+            if symbol and disease.startswith("OMIM:"):
+                diseases[symbol].add(disease.split(":", 1)[1])
+    log.info("gene-disease links: %d genes, %d codes",
+             len(diseases), sum(len(v) for v in diseases.values()))
+    return dict(diseases)
+
+
 def read_hpo_labels(obo_path: Path) -> dict[str, str]:
     """Map HPO id -> English term name from hp.obo."""
     labels: dict[str, str] = {}
