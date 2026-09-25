@@ -176,6 +176,25 @@ expected-symptom volume, recorded provenance, and how much text still reads as
 English. Thresholds sit just above what a good build produces, so ordinary
 variation passes and a stage that silently did nothing does not.
 
+### Publishing a release
+
+The database and the files it was built from exist only where they were
+built. Every database that reaches a server is also published as a GitHub
+release, so it can be fetched, checked and rebuilt from somewhere other than
+one laptop:
+
+```bash
+scripts/package_release.sh dist/      # verifies genes.db, then packs it
+gh release create db-vX.Y.Z dist/genes-db.tar.gz dist/genes-build-inputs.tar.gz dist/SHA256SUMS \
+  --target main --title db-vX.Y.Z --notes "..."
+```
+
+`genes-build-inputs.tar.gz` carries `genes.fetch.json`,
+`genes.translations.json`, `genes.summaries.json` and `genes_v4.db`: without
+them a rebuild pays for every LLM translation again, and does not come out the
+same. The archives are reproducible, so packing the same files twice gives the
+same sha256 — that hash is what a deployment pins.
+
 ### The HPO ancestor graph
 
 The database carries a closure over HPO's `is_a` graph (`hpo_ancestros`), which
