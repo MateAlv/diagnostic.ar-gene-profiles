@@ -29,7 +29,14 @@ python -m genesdb.build \
 
 python -m genesdb.plain_language --db genes.db   # plain-Spanish rewrites
 
-scp genes.db nodo0-diagnostic.ar:~/…            # deploy is a copy, nothing more
+# Additive passes over the built file, in this order. Each is idempotent.
+python scripts/add_hpo_graph.py genes.db --obo ../diagnosticar-question-agent/data/hp.obo
+python scripts/backfill_hpo_diseases.py genes.db --data-dir ../diagnosticar-question-agent/data
+curl -o mim2gene.txt https://omim.org/static/omim/data/mim2gene.txt
+python scripts/add_gene_mim.py genes.db --mim2gene mim2gene.txt
+
+python scripts/verify_db.py genes.db && \
+  scp genes.db nodo0-diagnostic.ar:~/…          # deploy is a copy, nothing more
 ```
 
 A full build is **50–70 minutes**, a full rewrite pass about **an hour**.
@@ -52,6 +59,8 @@ shipping**; the protocol and the sampling tool are in
 | UniProtKB (reviewed only) | protein function, diseases, OMIM ids |
 | `phenotype.hpoa` + `hp.obo` (HPO) | **expected symptoms with frequencies** |
 | `hp-es.babelon.tsv` (HPO i18n) | official Spanish symptom names, 97.6% coverage |
+| `phenotype_to_genes.txt` + `phenotype.hpoa` again | the OMIM codes and condition names UniProt omits |
+| `mim2gene.txt` (OMIM, public) | each gene's own OMIM entry number |
 
 The HPO files currently live in `../diagnosticar-question-agent/data/`
 (release **2026-06-23**).
