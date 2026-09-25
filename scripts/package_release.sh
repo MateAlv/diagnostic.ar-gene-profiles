@@ -18,7 +18,7 @@ set -euo pipefail
 out=${1:?usage: package_release.sh <out-dir>}
 mkdir -p "$out"
 
-python scripts/verify_db.py genes.db
+python3 scripts/verify_db.py genes.db
 
 pack() {
     local name=$1; shift
