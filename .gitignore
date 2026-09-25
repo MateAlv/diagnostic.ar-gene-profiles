@@ -23,3 +23,6 @@ review/
 # Unrelated files that happen to sit in this folder
 *.xlsx
 mim2gene.txt
+
+# Release archives, built by scripts/package_release.sh
+dist/
