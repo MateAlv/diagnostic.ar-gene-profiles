@@ -20,6 +20,7 @@ from genesdb.hpo import _parse_frequency, read_hpo_version  # noqa: E402
 from genesdb.query import GeneProfileDB  # noqa: E402
 from genesdb.schema import create_schema, write_build_info  # noqa: E402
 from genesdb.translate import clean_source_text  # noqa: E402
+from genesdb import translate_summaries  # noqa: E402
 
 
 @pytest.fixture
@@ -358,3 +359,264 @@ def test_quota_errors_are_distinguishable_from_transient_ones() -> None:
     """Retrying a spent quota only burns minutes rediscovering the same wall."""
     from genesdb.codex import CodexError, CodexQuotaError
     assert issubclass(CodexQuotaError, CodexError)
+
+
+# --- Finding the texts an interrupted build left in English -----------------
+
+def test_looks_english_separates_the_two_languages() -> None:
+    english = ("The protein encoded by this gene is a member of the superfamily "
+               "of ATP-binding cassette transporters.")
+    spanish = ("La proteína codificada por este gen es miembro de la superfamilia "
+               "de transportadores con cassette de unión a ATP.")
+    assert translate_summaries.looks_english(english)
+    assert not translate_summaries.looks_english(spanish)
+
+
+@pytest.mark.parametrize("text", [None, "", "   "])
+def test_looks_english_ignores_empty_text(text) -> None:
+    """An empty column is missing data, not an untranslated one."""
+    assert not translate_summaries.looks_english(text)
+
+
+def test_looks_english_tolerates_english_technical_terms() -> None:
+    """Spanish molecular biology keeps terms like 'helix-loop-helix' untranslated;
+    a row is not English because it contains them."""
+    text = ("Este gen codifica el factor de transcripción 4, un factor de "
+            "transcripción basic helix-loop-helix que reconoce un sitio E-box.")
+    assert not translate_summaries.looks_english(text)
+
+
+def test_collect_pending_finds_each_column_independently(tmp_path: Path) -> None:
+    """The two columns drift apart: a gene can have a Spanish summary and an
+    English function, or the reverse."""
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, tecnico_resumen_es, tecnico_funcion_es, raw_json)"
+        " VALUES (?, ?, ?, '{}')",
+        ("ACE", "Este gen codifica una enzima que regula la presión arterial.",
+         "Dipeptidyl carboxypeptidase that removes dipeptides from the C-terminus."),
+    )
+    conn.execute(
+        "INSERT INTO genes (simbolo, tecnico_resumen_es, tecnico_funcion_es, raw_json)"
+        " VALUES (?, ?, ?, '{}')",
+        ("TCF4", "This gene encodes transcription factor 4, which binds an E-box.",
+         "Participa en la vía de señalización Wnt y modula la expresión de MYC."),
+    )
+    conn.commit()
+
+    pending = translate_summaries.collect_pending(conn)
+    conn.close()
+
+    assert {(symbol, field) for symbol, field, _ in pending} == {
+        ("ACE", "tecnico_funcion_es"),
+        ("TCF4", "tecnico_resumen_es"),
+    }
+
+
+def test_apply_cache_leaves_untranslated_rows_alone(tmp_path: Path) -> None:
+    """Additive: a row with no translation keeps whatever it had."""
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, tecnico_resumen_es, tecnico_funcion_es, raw_json)"
+        " VALUES ('TCF4', 'This gene encodes transcription factor 4.', 'Vía Wnt.', '{}')"
+    )
+    conn.commit()
+
+    translate_summaries.apply_cache(conn, {"TCF4:tecnico_resumen_es": "Este gen codifica el factor 4."})
+
+    row = conn.execute(
+        "SELECT tecnico_resumen_es, tecnico_funcion_es FROM genes WHERE simbolo = 'TCF4'"
+    ).fetchone()
+    conn.close()
+    assert row == ("Este gen codifica el factor 4.", "Vía Wnt.")
+
+
+def test_a_reply_still_in_english_is_rejected() -> None:
+    """Echoing the source back would hide the row from the next run's detector."""
+    items = [("TCF4", "tecnico_resumen_es", "This gene encodes transcription factor 4.")]
+
+    def echo(prompt, schema, *, model=None, timeout=180):
+        return {"translations": [{"id": "TCF4:tecnico_resumen_es",
+                                  "text": "", "es": "This gene encodes transcription factor 4."}]}
+
+    assert translate_summaries._translate_batch(items, model=None, timeout=1, complete=echo) == {}
+
+
+def test_a_hallucinated_id_is_never_written() -> None:
+    """A key we did not send would otherwise be written to whichever gene it names."""
+    items = [("TCF4", "tecnico_resumen_es", "This gene encodes transcription factor 4.")]
+
+    def invents(prompt, schema, *, model=None, timeout=180):
+        return {"translations": [{"id": "CFTR:tecnico_resumen_es",
+                                  "es": "Este gen codifica un canal de cloruro."}]}
+
+    assert translate_summaries._translate_batch(items, model=None, timeout=1, complete=invents) == {}
+
+
+# --- HPO graph closure ------------------------------------------------------
+
+@pytest.fixture
+def toy_parents() -> dict[str, set[str]]:
+    """A slice of HPO's shape: Convulsiones -> generalizadas -> mioclónicas."""
+    return {
+        "HP:0002123": {"HP:0002197"},          # mioclónicas generalizadas
+        "HP:0002197": {"HP:0001250"},          # generalizadas
+        "HP:0001250": {"HP:0012638"},          # Convulsiones
+        "HP:0012638": {"HP:0000707"},
+        "HP:0000707": {"HP:0000118"},          # near-root
+    }
+
+
+def test_closure_records_the_hop_distance(toy_parents) -> None:
+    from genesdb.hpo import build_ancestor_closure
+    edges = {(a, b): d for a, b, d in build_ancestor_closure(toy_parents, {"HP:0002123"})}
+    assert edges[("HP:0002123", "HP:0002197")] == 1
+    assert edges[("HP:0002123", "HP:0001250")] == 2
+
+
+def test_closure_stops_before_the_near_root_terms(toy_parents) -> None:
+    """Unbounded, everything reaches "Phenotypic abnormality" and every gene
+    matches every symptom.
+
+    Deliberately uses the *default* depth rather than passing one: the shipped
+    constant is the thing that has to be safe, and a test that supplies its own
+    bound would pass however the default were changed.
+    """
+    from genesdb.hpo import build_ancestor_closure
+    reached = {a for _, a, _ in build_ancestor_closure(toy_parents, {"HP:0002123"})}
+    assert "HP:0001250" in reached          # Convulsiones, 2 hops — the useful one
+    assert "HP:0000118" not in reached      # Phenotypic abnormality, 5 hops
+
+
+def test_closure_depth_is_configurable(toy_parents) -> None:
+    from genesdb.hpo import build_ancestor_closure
+    shallow = {a for _, a, _ in build_ancestor_closure(toy_parents, {"HP:0002123"}, max_depth=1)}
+    assert shallow == {"HP:0002197"}
+
+
+def test_closure_takes_the_shortest_path(toy_parents) -> None:
+    """HPO is a DAG: a term reachable by both two and four hops is two away."""
+    from genesdb.hpo import build_ancestor_closure
+    parents = dict(toy_parents)
+    parents["HP:0002123"] = {"HP:0002197", "HP:0001250"}  # also a direct edge
+    edges = {(a, b): d for a, b, d in build_ancestor_closure(parents, {"HP:0002123"})}
+    assert edges[("HP:0002123", "HP:0001250")] == 1
+
+
+def test_read_parents_ignores_obsolete_and_blank_lines(tmp_path: Path) -> None:
+    obo = tmp_path / "hp.obo"
+    obo.write_text(
+        "[Term]\nid: HP:0002123\nname: Myoclonic seizure\n"
+        "is_a: HP:0002197 ! Generalized seizure\n\n"
+        "[Typedef]\nid: part_of\nname: part of\n",
+        encoding="utf-8",
+    )
+    from genesdb.hpo import read_parents
+    assert read_parents(obo) == {"HP:0002123": {"HP:0002197"}}
+
+
+# --- The OMIM codes UniProt does not know -----------------------------------
+
+def test_read_gene_diseases_links_genes_to_omim(tmp_path: Path) -> None:
+    """HPO's own gene→disease links, which UniProt's curation omits.
+
+    TCF4 is the case that exposed this: UniProt knows it as a type 2 diabetes
+    susceptibility locus (OMIM 125853) and not as the cause of Pitt-Hopkins
+    syndrome (610954), so the gene shipped with 3 expected symptoms instead of
+    66. Symptoms are joined by OMIM code, so a missing code drops every symptom
+    beneath it silently.
+    """
+    path = tmp_path / "phenotype_to_genes.txt"
+    path.write_text(
+        "hpo_id\thpo_name\tncbi_gene_id\tgene_symbol\tdisease_id\n"
+        "HP:0000582\tUpslanted palpebral fissure\t6925\tTCF4\tOMIM:610954\n"
+        "HP:0000582\tUpslanted palpebral fissure\t6925\tTCF4\tORPHA:2896\n"
+        "HP:0001250\tSeizure\t6925\tTCF4\tOMIM:610954\n",
+        encoding="utf-8",
+    )
+
+    from genesdb.hpo import read_gene_diseases
+    links = read_gene_diseases(path)
+
+    assert links["TCF4"] == {"610954"}, "ORPHA ids are not OMIM codes"
+
+
+def test_read_gene_diseases_ignores_non_omim_identifiers(tmp_path: Path) -> None:
+    path = tmp_path / "phenotype_to_genes.txt"
+    path.write_text(
+        "hpo_id\thpo_name\tncbi_gene_id\tgene_symbol\tdisease_id\n"
+        "HP:0001250\tSeizure\t1\tGENE1\tORPHA:2896\n"
+        "HP:0001250\tSeizure\t1\tGENE1\tDECIPHER:14\n",
+        encoding="utf-8",
+    )
+
+    from genesdb.hpo import read_gene_diseases
+    assert read_gene_diseases(path) == {}
+
+
+def _load_script(name: str):
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gene_mim_prefers_the_symbol_over_a_wrong_ncbi_id(tmp_path: Path) -> None:
+    """CNP was stored with NPPC's NCBI id; matching on it opened NPPC's page."""
+    mim2gene = tmp_path / "mim2gene.txt"
+    mim2gene.write_text(
+        "# Generated: 2026-09-24\n"
+        "123830\tgene\t1267\tCNP\tENSG00000173786\n"
+        "600296\tgene\t4880\tNPPC\tENSG00000163273\n"
+        "609279\tgene\t55835\tCPAP\tENSG00000151849\n"
+        "610954\tphenotype\t\t\t\n",
+        encoding="utf-8",
+    )
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    for symbol, ncbi in (("CNP", "4880"), ("CENPJ", "55835"), ("ORPHAN1", "999")):
+        conn.execute(
+            "INSERT INTO genes (simbolo, ncbi_id, raw_json) VALUES (?, ?, '{}')", (symbol, ncbi))
+    conn.commit()
+    conn.close()
+
+    found, total = _load_script("add_gene_mim").run(path, mim2gene)
+
+    conn = sqlite3.connect(path)
+    mims = dict(conn.execute("SELECT simbolo, omim_gen FROM genes"))
+    assert mims == {"CNP": "123830", "CENPJ": "609279", "ORPHAN1": None}
+    assert (found, total) == (2, 3)
+
+
+def test_recovered_codes_become_named_conditions(tmp_path: Path) -> None:
+    """TCF4 listed diabetes alone while its symptoms came from Pitt-Hopkins."""
+    from genesdb.translate import BulkTranslator
+
+    path = tmp_path / "genes.db"
+    conn = sqlite3.connect(path)
+    create_schema(conn)
+    conn.execute(
+        "INSERT INTO genes (simbolo, enfermedades_es, codigo_omim, raw_json) VALUES (?, ?, ?, '{}')",
+        ("TCF4",
+         json.dumps([{"nombre": "Diabetes mellitus tipo 2", "descripcion_es": "", "omim": "125853"}]),
+         json.dumps(["125853", "610954", "999999"])),
+    )
+    translator = BulkTranslator(cache={"Pitt-Hopkins syndrome": "Síndrome de Pitt-Hopkins"})
+    names = {"610954": "Pitt-Hopkins syndrome"}
+
+    backfill = _load_script("backfill_hpo_diseases")
+    assert backfill.name_conditions(conn, names, translator) == 1
+    assert backfill.name_conditions(conn, names, translator) == 0, "rerun must add nothing"
+
+    named = json.loads(conn.execute("SELECT enfermedades_es FROM genes").fetchone()[0])
+    assert [(d["nombre"], d["omim"]) for d in named] == [
+        ("Diabetes mellitus tipo 2", "125853"),
+        ("Síndrome de Pitt-Hopkins", "610954"),
+    ], "UniProt's entry stays first; a code HPO cannot name is left out"

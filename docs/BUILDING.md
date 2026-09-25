@@ -156,6 +156,65 @@ build.
 | `--skip-translation` | keep English; fast structural checks |
 | `--ncbi-api-key` | raises NCBI from 3 to 10 req/s |
 
+## Verify before copying
+
+Nothing between this machine and the results screen inspects the database: it
+is built here and shipped with `scp`. A translation stage that stopped partway
+once put **809 English texts on a Spanish page** in front of families, and
+nothing failed — the build reported success, the copy succeeded, and the defect
+was found by reading the staging site.
+
+So the copy is gated:
+
+```bash
+python scripts/verify_db.py genes.db && \
+  scp genes.db nodo0-diagnostic.ar:~/diagnostic.ar/diagnostic.ar-staging/data/genes.db
+```
+
+It checks the gene count against the model's vocabulary, summary coverage,
+expected-symptom volume, recorded provenance, and how much text still reads as
+English. Thresholds sit just above what a good build produces, so ordinary
+variation passes and a stage that silently did nothing does not.
+
+### The HPO ancestor graph
+
+The database carries a closure over HPO's `is_a` graph (`hpo_ancestros`), which
+is what lets a reported phenotype match the more specific ones a disease is
+annotated with. Without it the results screen reads **"sin coincidencias" on
+every gene**: families write general language, so the extractor returns
+*Convulsiones*, while diseases are annotated with *Espasmos infantiles*.
+
+```bash
+python scripts/add_hpo_graph.py genes.db --obo ../diagnostic.ar-api/data/hpo/hp.obo
+```
+
+Bounded at **three hops**, and the bound is load-bearing. Depth 3 admits
+*Convulsiones febriles* under a reported *Convulsiones*; depth 4 adds nothing;
+unbounded, every term reaches *Phenotypic abnormality* and its 18,708
+descendants, at which point every gene matches every symptom.
+
+A descendant-count cap was tried first and rejected: *Seizure* has 346
+descendants and *Abnormality of the mouth* has 493, so no threshold separates a
+useful clinical finding from a structural category. Hop distance does.
+
+Only the terms diseases are actually annotated with get a closure — 8,728 of
+the ontology's 19,934, about 35,000 edges and 3 MB.
+
+### Repairing an interrupted translation
+
+The two Spanish columns drift apart independently — a gene can have a Spanish
+summary and an English function, or the reverse — so the rows are found by
+reading the text rather than by a flag:
+
+```bash
+python -m genesdb.translate_summaries --db genes.db --report   # count only
+python -m genesdb.translate_summaries --db genes.db            # fix them
+```
+
+Additive and resumable: translations are cached per batch, a failed batch
+leaves its rows untouched, and a reply that comes back still in English is
+refused rather than stored — storing it would hide the row from the next run.
+
 ## Where the data comes from
 
 | Source | Gives |
