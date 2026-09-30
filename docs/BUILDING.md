@@ -219,6 +219,25 @@ useful clinical finding from a structural category. Hop distance does.
 Only the terms diseases are actually annotated with get a closure — 8,728 of
 the ontology's 19,934, about 35,000 edges and 3 MB.
 
+### The HPO term tree and gene coverage
+
+The wizard warns when a reported symptom barely narrows the search and lets the
+person browse down to a more specific one. That reads three tables: every HPO
+term with its Spanish label (`hpo_terminos`), every direct `is_a` edge
+(`hpo_hijos`), and how many genes each term reaches — genes with a disease
+annotated with it or with anything beneath it (`termino_cobertura`).
+
+```bash
+python3 scripts/add_term_tree.py genes.db \
+  --obo ../diagnostic.ar-api/data/hpo/hp.obo \
+  --labels ../diagnostic.ar-api/data/hpo/hp-es.json
+```
+
+Use the symptom search's own `hp.obo` and `hp-es.json`, so a term reads the
+same in the search and in the dialog. Additive and idempotent; half a second.
+`verify_db.py` fails a database without it. For scale: "Convulsiones" reaches
+1,560 genes, "Micropene" 214, "Fiebre baja" 1; 1,000 terms reach 100 or more.
+
 ### Repairing an interrupted translation
 
 The two Spanish columns drift apart independently — a gene can have a Spanish

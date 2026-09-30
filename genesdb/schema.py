@@ -72,6 +72,31 @@ CREATE TABLE IF NOT EXISTS hpo_ancestros (
 
 CREATE INDEX IF NOT EXISTS idx_ancestros_ancestro ON hpo_ancestros(ancestro_id);
 
+-- The whole HPO tree, for browsing from a general term to more specific ones
+-- (the wizard's "too general" dialog). Unlike hpo_ancestros, which only
+-- climbs a few hops from annotated terms, this holds every term and every
+-- direct is_a edge, with the same Spanish labels the symptom search shows.
+CREATE TABLE IF NOT EXISTS hpo_terminos (
+    hpo_id    TEXT PRIMARY KEY,
+    nombre    TEXT NOT NULL,     -- Spanish label, English where none exists
+    nombre_en TEXT
+);
+
+CREATE TABLE IF NOT EXISTS hpo_hijos (
+    padre TEXT NOT NULL,
+    hijo  TEXT NOT NULL,
+    PRIMARY KEY (padre, hijo)
+);
+
+-- How many genes a term reaches: genes with a disease annotated with the term
+-- or with anything beneath it. The measure of how much a term narrows a
+-- search -- "Convulsiones" reaches over a thousand, "Espasmos infantiles" a
+-- fraction of that. Terms that reach no gene are left out.
+CREATE TABLE IF NOT EXISTS termino_cobertura (
+    hpo_id TEXT PRIMARY KEY,
+    genes  INTEGER NOT NULL
+);
+
 -- One row. Records what this database was built from.
 CREATE TABLE IF NOT EXISTS build_info (
     clave TEXT PRIMARY KEY,

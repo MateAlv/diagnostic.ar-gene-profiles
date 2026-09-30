@@ -96,6 +96,20 @@ def verify(path: Path) -> bool:
     results.append(check("HPO ancestor graph", edges > 20_000,
                          f"{edges} edges" if graph else "table missing — run scripts/add_hpo_graph.py"))
 
+    # The wizard's "too general" dialog browses this tree. Without it the
+    # warning never fires and nobody notices, so a missing tree fails here.
+    tree_tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('hpo_hijos', 'termino_cobertura', 'hpo_terminos')"
+    )}
+    if len(tree_tables) == 3:
+        tree_edges = conn.execute("SELECT COUNT(*) FROM hpo_hijos").fetchone()[0]
+        covered = conn.execute("SELECT COUNT(*) FROM termino_cobertura").fetchone()[0]
+        results.append(check("HPO term tree", tree_edges > 20_000 and covered > 8_000,
+                             f"{tree_edges} edges, {covered} terms with gene coverage"))
+    else:
+        results.append(check("HPO term tree", False, "tables missing — run scripts/add_term_tree.py"))
+
     # Gene→disease links come from UniProt, which curates a subset: it knows
     # TCF4 as a diabetes susceptibility locus and not as the cause of
     # Pitt-Hopkins, so that gene shipped with 3 expected symptoms instead of
