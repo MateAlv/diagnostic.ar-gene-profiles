@@ -11,7 +11,7 @@ was found by reading the staging site.
 
 Exits non-zero when a check fails, so it can gate the copy:
 
-    python scripts/verify_db.py genes.db && scp genes.db nodo0:...
+    python scripts/verify_db.py genes.db && scp genes.db <server>:...
 
 Thresholds are set just above what a good build currently produces, so ordinary
 variation passes and a stage that silently did nothing does not.

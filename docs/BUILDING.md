@@ -7,17 +7,31 @@ universe used and the gene count.
 
 ```bash
 pip install -r requirements.txt
+scripts/fetch_hpo_translations.sh      # official Spanish HPO labels — do this first
 
 python -m genesdb.build \
   --data-dir ../diagnosticar-question-agent/data \
-  --model-genes /path/to/graphens_best_model/genes.json \
+  --model-genes /path/to/model/genes.json \
   --out genes.db \
-  --reuse genes_v4.db
+  --reuse genes_v4.db        # reuses ~10k existing translations
+
+python -m genesdb.plain_language --db genes.db   # plain-Spanish rewrites
+
+# Additive passes over the built file, in this order. Each is idempotent.
+python scripts/add_hpo_graph.py genes.db --obo ../diagnosticar-question-agent/data/hp.obo
+python scripts/backfill_hpo_diseases.py genes.db --data-dir ../diagnosticar-question-agent/data
+curl -o mim2gene.txt https://omim.org/static/omim/data/mim2gene.txt
+python scripts/add_gene_mim.py genes.db --mim2gene mim2gene.txt
+
+python scripts/verify_db.py genes.db && \
+  scp genes.db <server>:<path>/genes.db    # deploy is a copy, nothing more
 ```
+
+A full build is 50–70 minutes, a full rewrite pass about an hour.
 
 ## `--model-genes` is not optional in practice
 
-GenPhenAI's classifier has a fixed output layer of 5229 classes, so it can only
+The diagnostic.ar model's classifier has a fixed output layer of 5229 classes, so it can only
 ever return a symbol from its own vocabulary — `genes.json` in the checkpoint
 directory. The first entry, `-`, is a placeholder, leaving **5,228 real genes**.
 
@@ -29,7 +43,7 @@ without `--model-genes` silently loses those 126 (`ABCC4`, `ACADL`, `AGTR2`,
 Those 126 therefore have no `ncbi_gene_id` in the annotation files either, so
 the build resolves their symbols through NCBI esearch. All 126 resolve.
 
-**When GenPhenAI is retrained the vocabulary changes.** Copy the new
+**When the model is retrained the vocabulary changes.** Copy the new
 `genes.json` and rebuild, or the two drift apart again.
 
 ## Translation: use the official labels, not the web endpoint
@@ -106,7 +120,6 @@ If the remaining 481 strings ever become a problem, the real options are:
 |---|---|---|
 | **Official HPO labels** | free | already covers 97.6%; do this first |
 | **Google Cloud Translation API** | ~$20 per million chars | a real key, real quotas, no blocking |
-| **Local model via Ollama** | free | `qwen3.5:4b` is on this box; slower, needs review |
 | **Wait it out** | free | the block is temporary; the build resumes from cache |
 
 A paid key is only worth it if translation becomes a recurring bottleneck. With
@@ -168,7 +181,7 @@ So the copy is gated:
 
 ```bash
 python scripts/verify_db.py genes.db && \
-  scp genes.db nodo0-diagnostic.ar:~/diagnostic.ar/diagnostic.ar-staging/data/genes.db
+  scp genes.db <server>:<path>/genes.db
 ```
 
 It checks the gene count against the model's vocabulary, summary coverage,
@@ -262,6 +275,9 @@ refused rather than stored — storing it would hide the row from the next run.
 | NCBI Gene (E-utilities) | name, chromosome, location, aliases, summary |
 | UniProtKB (reviewed only) | protein function, diseases, OMIM ids |
 | `phenotype.hpoa` + `hp.obo` (HPO) | expected symptoms with frequencies |
+| `hp-es.babelon.tsv` (HPO i18n) | official Spanish symptom names, 97.6% coverage |
+| `phenotype_to_genes.txt` + `phenotype.hpoa` again | the OMIM codes and condition names UniProt omits |
+| `mim2gene.txt` (OMIM, public) | each gene's own OMIM entry number |
 
 Symptoms carrying the `NOT` qualifier are excluded, so a phenotype recorded as
 *absent* in a disease is never presented as expected.
