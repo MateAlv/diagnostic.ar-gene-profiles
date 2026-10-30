@@ -1,8 +1,8 @@
 """Fetch gene profiles from NCBI Gene, UniProtKB and the HPO annotation files.
 
-This is the stage that was missing: the original `crear_db.py` only repaired and
-compiled a directory of per-gene JSON files that no longer exists, so the
-database could not be rebuilt from scratch.
+The original `crear_db.py` (in `legacy/`) compiled per-gene JSON files that
+were fetched separately. This module adds that fetch, so the database can be
+rebuilt from scratch.
 """
 
 from __future__ import annotations

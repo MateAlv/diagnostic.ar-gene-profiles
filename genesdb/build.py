@@ -307,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reuse", type=Path, help="previous .db to reuse translations from")
     parser.add_argument("--ncbi-api-key", help="raises the NCBI rate limit from 3/s to 10/s")
     parser.add_argument("--model-genes", type=Path,
-                        help="genes.json from the GenPhenAI checkpoint — the authoritative "
+                        help="genes.json from the model checkpoint — the authoritative "
                              "gene vocabulary; without it the HPO annotation files are used")
     parser.add_argument("--workers", type=int, default=2,
                         help="concurrent translation requests (default 2)")
